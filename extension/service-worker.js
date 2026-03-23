@@ -46,22 +46,57 @@ function isPdfDownload(item) {
   return isPdfUrl(item.url);
 }
 
-function openInReamlet(url) {
-  chrome.runtime.sendNativeMessage(NATIVE_HOST, { url }, (response) => {
-    if (chrome.runtime.lastError) {
-      console.error('[Reamlet] Native messaging error:', chrome.runtime.lastError.message);
-    }
+// Send a message to the native host and return a Promise that resolves with
+// the response, or rejects on any native messaging error.
+function sendToNativeHost(url) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendNativeMessage(NATIVE_HOST, { url }, (response) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve(response);
+      }
+    });
   });
 }
 
+// Attempt to open the PDF in Reamlet.
+// Returns true on success, false on any failure.
+async function openInReamlet(url) {
+  try {
+    const response = await sendToNativeHost(url);
+    if (!response?.ok) {
+      console.error('[Reamlet] Host returned error:', response?.error);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('[Reamlet] Native messaging failed:', err.message);
+    return false;
+  }
+}
+
+// After intercepting a navigation, clean up the tab:
+//   success → go back if there's history, otherwise close the tab
+//   failure → navigate to the original URL so the browser handles it
+async function resolveTab(tabId, originalUrl, success) {
+  if (success) {
+    chrome.tabs.goBack(tabId, () => {
+      if (chrome.runtime.lastError) {
+        // No history — tab was opened just for this PDF, close it
+        chrome.tabs.remove(tabId);
+      }
+    });
+  } else {
+    // Fall back: let the browser open the PDF normally
+    chrome.tabs.update(tabId, { url: originalUrl });
+  }
+}
+
 // ── PDF interception: content-type ────────────────────────────
-//
-// webRequest in MV3 is observation-only (no blocking mode).
-// When we detect application/pdf in response headers, redirect the
-// tab away immediately and forward the URL to the native host.
 
 chrome.webRequest.onHeadersReceived.addListener(
-  (details) => {
+  async (details) => {
     if (!interceptEnabled) return;
     if (details.type !== 'main_frame') return;
 
@@ -71,38 +106,50 @@ chrome.webRequest.onHeadersReceived.addListener(
 
     if (!contentType.includes('application/pdf')) return;
 
-    // Redirect the tab away before the browser renders the PDF.
+    const url = details.url;
+    console.log('[Reamlet] Intercepted PDF via content-type:', url);
+
+    // Redirect away immediately to cancel the browser's PDF render
     chrome.tabs.update(details.tabId, { url: 'about:blank' });
-    openInReamlet(details.url);
+
+    const ok = await openInReamlet(url);
+    await resolveTab(details.tabId, url, ok);
   },
   { urls: ['<all_urls>'] },
   ['responseHeaders']
 );
 
 // ── PDF interception: URL pattern ─────────────────────────────
-//
-// Catch navigations to .pdf URLs before the request is made.
-// We use webNavigation instead of declarativeNetRequest so that
-// the same code path handles interception toggle at runtime.
 
 chrome.webNavigation.onBeforeNavigate.addListener(
-  (details) => {
+  async (details) => {
     if (!interceptEnabled) return;
-    if (details.frameId !== 0) return; // main frame only
+    if (details.frameId !== 0) return;
+
+    const url = details.url;
+    console.log('[Reamlet] Intercepted PDF via URL pattern:', url);
 
     chrome.tabs.update(details.tabId, { url: 'about:blank' });
-    openInReamlet(details.url);
+
+    const ok = await openInReamlet(url);
+    await resolveTab(details.tabId, url, ok);
   },
   { url: [{ urlMatches: '\\.pdf(\\?[^#]*)?(?:#.*)?$' }] }
 );
 
 // ── PDF interception: downloads ───────────────────────────────
 
-chrome.downloads.onCreated.addListener((item) => {
+chrome.downloads.onCreated.addListener(async (item) => {
   if (!interceptEnabled) return;
   if (!isPdfDownload(item)) return;
 
-  chrome.downloads.cancel(item.id, () => {
-    openInReamlet(item.url);
-  });
+  console.log('[Reamlet] Intercepted PDF download:', item.url);
+
+  chrome.downloads.cancel(item.id);
+
+  const ok = await openInReamlet(item.url);
+  if (!ok) {
+    // Fall back: open the URL in a new tab so the browser downloads it
+    chrome.tabs.create({ url: item.url });
+  }
 });

@@ -8,6 +8,7 @@
     "downloads",
     "nativeMessaging",
     "storage",
+    "tabs",
     "webNavigation"
   ],
   "host_permissions": ["<all_urls>"],
