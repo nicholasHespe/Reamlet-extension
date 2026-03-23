@@ -3,7 +3,7 @@
 
 'use strict';
 
-const NATIVE_HOST = 'com.reamlet.chromeBridge';
+const NATIVE_HOST = 'com.reamlet.chromebridge';
 
 // ── State ─────────────────────────────────────────────────────
 
