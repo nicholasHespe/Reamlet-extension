@@ -66,7 +66,7 @@ async function openInReamlet(url) {
   try {
     const response = await sendToNativeHost(url);
     if (!response?.ok) {
-      console.error('[Reamlet] Host returned error:', response?.error);
+      console.error('[Reamlet] Host returned error:', response?.error, response?.checked ?? '');
       return false;
     }
     return true;
