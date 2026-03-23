@@ -8,17 +8,56 @@ const NATIVE_HOST = 'com.reamlet.chromebridge';
 // ── State ─────────────────────────────────────────────────────
 
 let interceptEnabled = true;
+let disabledDomains  = new Set();
 
-chrome.storage.local.get(['interceptEnabled'], (result) => {
+// Track the last committed URL for each tab in session storage so we can
+// identify the browsing context even during mid-navigation (when tab.url is empty).
+// chrome.storage.session persists across service worker restarts.
+chrome.tabs.query({}, (tabs) => {
+  const items = {};
+  for (const tab of tabs) {
+    if (tab.id != null && tab.url && getHostname(tab.url)) {
+      items[`tabUrl_${tab.id}`] = tab.url;
+    }
+  }
+  if (Object.keys(items).length > 0) chrome.storage.session.set(items);
+});
+chrome.webNavigation.onCommitted.addListener((details) => {
+  if (details.frameId !== 0) return;
+  if (getHostname(details.url)) {
+    chrome.storage.session.set({ [`tabUrl_${details.tabId}`]: details.url });
+  }
+});
+chrome.tabs.onRemoved.addListener((tabId) => {
+  chrome.storage.session.remove(`tabUrl_${tabId}`);
+});
+
+function getTabContextUrl(tabId) {
+  return new Promise((resolve) => {
+    chrome.storage.session.get(`tabUrl_${tabId}`, (result) => {
+      resolve(result[`tabUrl_${tabId}`] ?? null);
+    });
+  });
+}
+
+chrome.storage.local.get(['interceptEnabled', 'disabledDomains'], (result) => {
   if (result.interceptEnabled !== undefined) {
     interceptEnabled = result.interceptEnabled;
   }
+  if (Array.isArray(result.disabledDomains)) {
+    disabledDomains = new Set(result.disabledDomains);
+  }
+  updateBadge();
 });
 
 chrome.storage.onChanged.addListener((changes) => {
   if ('interceptEnabled' in changes) {
     interceptEnabled = changes.interceptEnabled.newValue;
     updateBadge();
+  }
+  if ('disabledDomains' in changes) {
+    disabledDomains = new Set(changes.disabledDomains.newValue ?? []);
+    console.log('[Reamlet] Site settings updated. Disabled domains:', [...disabledDomains]);
   }
 });
 
@@ -28,6 +67,34 @@ function updateBadge() {
 }
 
 // ── Helpers ───────────────────────────────────────────────────
+
+function getHostname(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return null;
+  }
+}
+
+// Returns the hostname to check against disabledDomains.
+// Prefers the browsing context (the page the user was on) over the PDF's own
+// domain, so that toggling a site controls all PDFs clicked from that site,
+// regardless of where the PDF file is actually hosted.
+function getContextHostname(pdfUrl, contextUrl) {
+  try {
+    const pdfHost = new URL(pdfUrl).hostname;
+    if (contextUrl) {
+      const ctx = new URL(contextUrl).hostname;
+      if (ctx && ctx !== pdfHost) return ctx;
+    }
+  } catch { /* ignore */ }
+  return getHostname(pdfUrl);
+}
+
+function isDomainDisabled(pdfUrl, contextUrl = null) {
+  const hostname = getContextHostname(pdfUrl, contextUrl);
+  return hostname ? disabledDomains.has(hostname) : false;
+}
 
 function isPdfUrl(url) {
   try {
@@ -48,9 +115,9 @@ function isPdfDownload(item) {
 
 // Send a message to the native host and return a Promise that resolves with
 // the response, or rejects on any native messaging error.
-function sendToNativeHost(url) {
+function sendToNativeHost(msg) {
   return new Promise((resolve, reject) => {
-    chrome.runtime.sendNativeMessage(NATIVE_HOST, { url }, (response) => {
+    chrome.runtime.sendNativeMessage(NATIVE_HOST, msg, (response) => {
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message));
       } else {
@@ -62,9 +129,9 @@ function sendToNativeHost(url) {
 
 // Attempt to open the PDF in Reamlet.
 // Returns true on success, false on any failure.
-async function openInReamlet(url) {
+async function openInReamlet(url, background = false) {
   try {
-    const response = await sendToNativeHost(url);
+    const response = await sendToNativeHost({ url, background });
     if (!response?.ok) {
       console.error('[Reamlet] Host returned error:', response?.error, response?.checked ?? '');
       return false;
@@ -129,11 +196,16 @@ chrome.webRequest.onHeadersReceived.addListener(
     if (!contentType.includes('application/pdf')) return;
 
     const url = details.url;
+    if (isDomainDisabled(url, details.initiator)) return;
+
     console.log('[Reamlet] Intercepted PDF via content-type:', url);
+
+    const tab = await chrome.tabs.get(details.tabId).catch(() => null);
+    const background = tab ? !tab.active : false;
 
     chrome.tabs.update(details.tabId, { url: 'about:blank' });
 
-    const ok = await openInReamlet(url);
+    const ok = await openInReamlet(url, background);
     await resolveTab(details.tabId, url, ok);
   },
   { urls: ['<all_urls>'] },
@@ -152,11 +224,23 @@ chrome.webNavigation.onBeforeNavigate.addListener(
     }
 
     const url = details.url;
+    const tab = await chrome.tabs.get(details.tabId).catch(() => null);
+
+    // For new tabs (url is empty), the opener tab is the browsing context.
+    // For same-tab navigations, use this tab's last committed URL from session storage.
+    const contextTabId = (tab?.url === '' && tab?.openerTabId != null)
+      ? tab.openerTabId
+      : details.tabId;
+    const contextUrl = await getTabContextUrl(contextTabId);
+    if (isDomainDisabled(url, contextUrl)) return;
+
     console.log('[Reamlet] Intercepted PDF via URL pattern:', url);
+
+    const background = tab ? !tab.active : false;
 
     chrome.tabs.update(details.tabId, { url: 'about:blank' });
 
-    const ok = await openInReamlet(url);
+    const ok = await openInReamlet(url, background);
     await resolveTab(details.tabId, url, ok);
   },
   { url: [{ urlMatches: '\\.pdf(\\?[^#]*)?(?:#.*)?$' }] }
@@ -167,6 +251,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(
 chrome.downloads.onCreated.addListener(async (item) => {
   if (!interceptEnabled) return;
   if (!isPdfDownload(item)) return;
+  if (isDomainDisabled(item.url, item.referrer)) return;
 
   console.log('[Reamlet] Intercepted PDF download:', item.url);
 

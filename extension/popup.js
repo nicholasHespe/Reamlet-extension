@@ -3,23 +3,67 @@
 
 'use strict';
 
-const toggle = document.getElementById('toggle');
-const status = document.getElementById('status');
+const globalToggle = document.getElementById('globalToggle');
+const domainSection = document.getElementById('domainSection');
+const domainLabel   = document.getElementById('domainLabel');
+const domainToggle  = document.getElementById('domainToggle');
+const status        = document.getElementById('status');
 
-chrome.storage.local.get(['interceptEnabled'], (result) => {
-  const enabled = result.interceptEnabled !== false; // default on
-  toggle.checked = enabled;
-  updateStatus(enabled);
+let currentHostname = null;
+let globalEnabled   = true;
+let disabledDomains = [];
+
+// Get the active tab's hostname
+chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+  try {
+    const url = tab?.url ?? '';
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      currentHostname = new URL(url).hostname;
+    }
+  } catch { /* ignore */ }
+
+  chrome.storage.local.get(['interceptEnabled', 'disabledDomains'], (result) => {
+    globalEnabled   = result.interceptEnabled !== false;
+    disabledDomains = result.disabledDomains ?? [];
+    render();
+  });
 });
 
-toggle.addEventListener('change', () => {
-  const enabled = toggle.checked;
-  chrome.storage.local.set({ interceptEnabled: enabled });
-  updateStatus(enabled);
+globalToggle.addEventListener('change', () => {
+  globalEnabled = globalToggle.checked;
+  chrome.storage.local.set({ interceptEnabled: globalEnabled });
+  render();
 });
 
-function updateStatus(enabled) {
-  status.textContent = enabled
-    ? 'PDFs will open in Reamlet.'
-    : 'Interception paused — PDFs open normally.';
+domainToggle.addEventListener('change', () => {
+  if (!currentHostname) return;
+  if (domainToggle.checked) {
+    disabledDomains = disabledDomains.filter(d => d !== currentHostname);
+  } else {
+    if (!disabledDomains.includes(currentHostname)) {
+      disabledDomains = [...disabledDomains, currentHostname];
+    }
+  }
+  chrome.storage.local.set({ disabledDomains });
+  render();
+});
+
+function render() {
+  globalToggle.checked = globalEnabled;
+
+  if (currentHostname) {
+    domainSection.style.display = '';
+    domainLabel.textContent = currentHostname;
+    const domainEnabled = !disabledDomains.includes(currentHostname);
+    domainToggle.checked  = domainEnabled;
+    domainToggle.disabled = !globalEnabled;
+  }
+
+  if (!globalEnabled) {
+    status.textContent = 'Interception paused — PDFs open normally.';
+  } else if (currentHostname && disabledDomains.includes(currentHostname)) {
+    status.textContent = 'PDFs on ' + currentHostname + ' open normally.';
+  } else {
+    status.textContent = 'PDFs will open in Reamlet.';
+  }
 }

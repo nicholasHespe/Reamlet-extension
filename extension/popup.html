@@ -33,9 +33,17 @@
 
     .label {
       color: #c8c8c8;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
-    /* Toggle switch */
+    hr {
+      border: none;
+      border-top: 1px solid #333;
+      margin: 10px 0;
+    }
+
     .toggle {
       position: relative;
       width: 36px;
@@ -72,6 +80,7 @@
 
     input:checked + .slider { background: #0078d4; }
     input:checked + .slider::before { transform: translateX(16px); }
+    input:disabled + .slider { opacity: 0.4; cursor: default; }
 
     .status {
       margin-top: 10px;
@@ -85,9 +94,19 @@
   <div class="row">
     <span class="label">Intercept PDFs</span>
     <label class="toggle">
-      <input type="checkbox" id="toggle" />
+      <input type="checkbox" id="globalToggle" />
       <span class="slider"></span>
     </label>
+  </div>
+  <div id="domainSection" style="display:none">
+    <hr />
+    <div class="row">
+      <span class="label" id="domainLabel"></span>
+      <label class="toggle">
+        <input type="checkbox" id="domainToggle" />
+        <span class="slider"></span>
+      </label>
+    </div>
   </div>
   <div class="status" id="status">Loading…</div>
   <script src="popup.js"></script>
