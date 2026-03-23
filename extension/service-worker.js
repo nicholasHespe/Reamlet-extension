@@ -88,10 +88,20 @@ async function resolveTab(tabId, originalUrl, success) {
       }
     });
   } else {
-    // Fall back: let the browser open the PDF normally
-    chrome.tabs.update(tabId, { url: originalUrl });
+    // Mark this tab so the next navigation event doesn't re-intercept it
+    bypassTabs.add(tabId);
+    chrome.tabs.update(tabId, { url: originalUrl }, () => {
+      if (chrome.runtime.lastError) {
+        // Tab was already closed — clean up
+        bypassTabs.delete(tabId);
+      }
+    });
   }
 }
+
+// Tabs currently being handed back to the browser after a failed intercept.
+// We skip these on the next navigation event so we don't loop.
+const bypassTabs = new Set();
 
 // ── PDF interception: content-type ────────────────────────────
 
@@ -99,6 +109,10 @@ chrome.webRequest.onHeadersReceived.addListener(
   async (details) => {
     if (!interceptEnabled) return;
     if (details.type !== 'main_frame') return;
+    if (bypassTabs.has(details.tabId)) {
+      bypassTabs.delete(details.tabId);
+      return;
+    }
 
     const contentType = (details.responseHeaders ?? []).find(
       (h) => h.name.toLowerCase() === 'content-type'
@@ -109,7 +123,6 @@ chrome.webRequest.onHeadersReceived.addListener(
     const url = details.url;
     console.log('[Reamlet] Intercepted PDF via content-type:', url);
 
-    // Redirect away immediately to cancel the browser's PDF render
     chrome.tabs.update(details.tabId, { url: 'about:blank' });
 
     const ok = await openInReamlet(url);
@@ -125,6 +138,10 @@ chrome.webNavigation.onBeforeNavigate.addListener(
   async (details) => {
     if (!interceptEnabled) return;
     if (details.frameId !== 0) return;
+    if (bypassTabs.has(details.tabId)) {
+      bypassTabs.delete(details.tabId);
+      return;
+    }
 
     const url = details.url;
     console.log('[Reamlet] Intercepted PDF via URL pattern:', url);
