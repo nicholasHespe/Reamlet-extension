@@ -255,11 +255,9 @@ chrome.downloads.onCreated.addListener(async (item) => {
 
   console.log('[Reamlet] Intercepted PDF download:', item.url);
 
-  chrome.downloads.cancel(item.id);
-
   const ok = await openInReamlet(item.url);
-  if (!ok) {
-    // Fall back: open the URL in a new tab so the browser downloads it
-    chrome.tabs.create({ url: item.url });
+  if (ok) {
+    chrome.downloads.cancel(item.id);
   }
+  // If !ok, the existing download proceeds normally — no new tab, no loop
 });
