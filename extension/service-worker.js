@@ -89,10 +89,10 @@ async function resolveTab(tabId, originalUrl, success) {
     });
   } else {
     // Mark this tab so the next navigation event doesn't re-intercept it
-    bypassTabs.add(tabId);
+    addBypass(tabId);
     chrome.tabs.update(tabId, { url: originalUrl }, () => {
       if (chrome.runtime.lastError) {
-        // Tab was already closed — clean up
+        // Tab was already closed — clean up immediately
         bypassTabs.delete(tabId);
       }
     });
@@ -100,8 +100,15 @@ async function resolveTab(tabId, originalUrl, success) {
 }
 
 // Tabs currently being handed back to the browser after a failed intercept.
-// We skip these on the next navigation event so we don't loop.
+// Consumed by onHeadersReceived (the last event in the navigation chain) so
+// that both onBeforeNavigate and onHeadersReceived are covered by one flag.
 const bypassTabs = new Set();
+
+function addBypass(tabId) {
+  bypassTabs.add(tabId);
+  // Safety cleanup in case onHeadersReceived never fires (e.g. non-HTTP URL).
+  setTimeout(() => bypassTabs.delete(tabId), 15000);
+}
 
 // ── PDF interception: content-type ────────────────────────────
 
@@ -110,6 +117,7 @@ chrome.webRequest.onHeadersReceived.addListener(
     if (!interceptEnabled) return;
     if (details.type !== 'main_frame') return;
     if (bypassTabs.has(details.tabId)) {
+      // Consume the flag here — this is the last event in the navigation chain.
       bypassTabs.delete(details.tabId);
       return;
     }
@@ -139,7 +147,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(
     if (!interceptEnabled) return;
     if (details.frameId !== 0) return;
     if (bypassTabs.has(details.tabId)) {
-      bypassTabs.delete(details.tabId);
+      // Don't delete here — onHeadersReceived will consume the flag.
       return;
     }
 
