@@ -1,0 +1,13 @@
+{
+  "name": "reamlet-native-host",
+  "version": "1.0.0",
+  "description": "Native messaging host that bridges the Reamlet Chrome extension to the Reamlet desktop app",
+  "main": "host.js",
+  "scripts": {
+    "build": "pkg host.js --target node18-win-x64 --output dist/reamlet-native-host.exe"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  },
+  "license": "GPL-3.0-or-later"
+}
