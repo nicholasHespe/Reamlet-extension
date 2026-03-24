@@ -10,6 +10,30 @@ const NATIVE_HOST = 'com.reamlet.chromebridge';
 let interceptEnabled = true;
 let disabledDomains  = new Set();
 
+// Block all interception during browser startup/session restore.
+// Set to true once the browser has had time to finish restoring tabs.
+// chrome.storage.session persists across service-worker restarts within a
+// session, so mid-session restarts of the worker re-enable immediately.
+let startupComplete = false;
+
+chrome.storage.session.get('startupComplete', (result) => {
+  if (result.startupComplete) startupComplete = true;
+});
+
+// Fresh browser start — wait 5 s for session restore to settle.
+chrome.runtime.onStartup.addListener(() => {
+  setTimeout(() => {
+    startupComplete = true;
+    chrome.storage.session.set({ startupComplete: true });
+  }, 5000);
+});
+
+// Extension install/update — no session restore, enable immediately.
+chrome.runtime.onInstalled.addListener(() => {
+  startupComplete = true;
+  chrome.storage.session.set({ startupComplete: true });
+});
+
 // Track the last committed URL for each tab in session storage so we can
 // identify the browsing context even during mid-navigation (when tab.url is empty).
 // chrome.storage.session persists across service worker restarts.
@@ -181,6 +205,7 @@ function addBypass(tabId) {
 
 chrome.webRequest.onHeadersReceived.addListener(
   async (details) => {
+    if (!startupComplete) return;
     if (!interceptEnabled) return;
     if (details.type !== 'main_frame') return;
     if (bypassTabs.has(details.tabId)) {
@@ -216,6 +241,7 @@ chrome.webRequest.onHeadersReceived.addListener(
 
 chrome.webNavigation.onBeforeNavigate.addListener(
   async (details) => {
+    if (!startupComplete) return;
     if (!interceptEnabled) return;
     if (details.frameId !== 0) return;
     if (bypassTabs.has(details.tabId)) {
@@ -249,6 +275,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(
 // ── PDF interception: downloads ───────────────────────────────
 
 chrome.downloads.onCreated.addListener(async (item) => {
+  if (!startupComplete) return;
   if (!interceptEnabled) return;
   if (!isPdfDownload(item)) return;
   if (isDomainDisabled(item.url, item.referrer)) return;
