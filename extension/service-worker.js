@@ -127,11 +127,11 @@ function sendToNativeHost(msg) {
   });
 }
 
-// Attempt to open the PDF in Reamlet.
+// Attempt to open a local file path in Reamlet via the native host.
 // Returns true on success, false on any failure.
-async function openInReamlet(url, background = false) {
+async function openInReamlet(filePath, background = false) {
   try {
-    const response = await sendToNativeHost({ url, background });
+    const response = await sendToNativeHost({ url: filePath, background });
     if (!response?.ok) {
       console.error('[Reamlet] Host returned error:', response?.error, response?.checked ?? '');
       return false;
@@ -142,6 +142,133 @@ async function openInReamlet(url, background = false) {
     return false;
   }
 }
+
+// Native messaging has a 1 MB message limit. Base64 adds ~33% overhead,
+// so cap raw PDF size at 750 KB to stay safely under the limit.
+const FETCH_FALLBACK_MAX_BYTES = 750 * 1024;
+
+// Fallback for cases where chrome.downloads fails (e.g. Content-Disposition: inline).
+// Fetches the URL directly using browser credentials, then passes the raw bytes
+// to the native host which writes them to %TEMP%\ReamletDownloads.
+async function tryFetchFallback(url, background = false) {
+  console.log('[Reamlet] Trying fetch() fallback for:', url);
+  try {
+    const res = await fetch(url, { credentials: 'include' });
+    if (!res.ok) {
+      console.error('[Reamlet] fetch() returned status:', res.status);
+      return false;
+    }
+    const contentType = res.headers.get('content-type') ?? '';
+    if (!contentType.includes('application/pdf')) {
+      console.error('[Reamlet] fetch() got unexpected content-type:', contentType);
+      return false;
+    }
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > FETCH_FALLBACK_MAX_BYTES) {
+      console.warn('[Reamlet] PDF too large for fetch fallback:', buf.byteLength, 'bytes — falling back to browser');
+      return false;
+    }
+    // Encode to base64 without spread (avoids stack overflow on large arrays)
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    const base64 = btoa(binary);
+    console.log('[Reamlet] fetch() got', buf.byteLength, 'bytes — sending to native host');
+    const response = await sendToNativeHost({ bytes: base64, background });
+    if (!response?.ok) {
+      console.error('[Reamlet] Host returned error for bytes message:', response?.error);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('[Reamlet] fetch() fallback error:', err.message);
+    return false;
+  }
+}
+
+// URLs of downloads we initiated ourselves — prevents re-interception by onCreated.
+const reamletDownloadUrls = new Set();
+
+// Download a PDF using Chrome (which carries browser session cookies/auth),
+// wait for completion, pass the local file path to Reamlet, then clean up.
+// Returns true if Reamlet was successfully launched with the file.
+function downloadViaChrome(url, background = false) {
+  return new Promise((resolve) => {
+    reamletDownloadUrls.add(url);
+
+    let filename;
+    try {
+      const base = new URL(url).pathname.split('/').pop() || 'download';
+      const name = base.toLowerCase().endsWith('.pdf') ? base : `${base}.pdf`;
+      filename = `${STAGING_FOLDER}/${name}`;
+    } catch {
+      filename = `${STAGING_FOLDER}/download.pdf`;
+    }
+
+    console.log('[Reamlet] downloadViaChrome starting — filename:', filename);
+
+    chrome.downloads.download(
+      { url, saveAs: false, filename, conflictAction: 'uniquify' },
+      (downloadId) => {
+        if (chrome.runtime.lastError || downloadId === undefined) {
+          reamletDownloadUrls.delete(url);
+          console.error('[Reamlet] chrome.downloads.download failed:', chrome.runtime.lastError?.message);
+          resolve(false);
+          return;
+        }
+
+        console.log('[Reamlet] Download started — id:', downloadId, 'filename:', filename);
+
+        const onChange = (delta) => {
+          if (delta.id !== downloadId) return;
+
+          if (delta.state) {
+            console.log('[Reamlet] Download', downloadId, 'state →', delta.state.current);
+          }
+          if (delta.error) {
+            console.error('[Reamlet] Download', downloadId, 'error →', delta.error.current);
+          }
+
+          if (delta.state?.current === 'complete') {
+            chrome.downloads.onChanged.removeListener(onChange);
+            reamletDownloadUrls.delete(url);
+            chrome.downloads.search({ id: downloadId }, async ([item]) => {
+              if (!item?.filename) {
+                console.error('[Reamlet] Download', downloadId, 'complete but filename missing');
+                resolve(false);
+                return;
+              }
+              console.log('[Reamlet] Download complete — local path:', item.filename);
+              const ok = await openInReamlet(item.filename, background);
+              console.log('[Reamlet] openInReamlet result:', ok);
+              // Erase from Chrome's download history — the native host moves
+              // the file to %TEMP%\ReamletDownloads so no removeFile needed here.
+              chrome.downloads.erase({ id: downloadId });
+              resolve(ok);
+            });
+          } else if (delta.state?.current === 'interrupted') {
+            chrome.downloads.onChanged.removeListener(onChange);
+            reamletDownloadUrls.delete(url);
+            const reason = delta.error?.current ?? 'unknown';
+            console.error('[Reamlet] Download', downloadId, 'interrupted — error:', reason);
+            if (reason === 'SERVER_BAD_CONTENT') {
+              console.log('[Reamlet] SERVER_BAD_CONTENT likely caused by Content-Disposition: inline — trying fetch fallback');
+              resolve(tryFetchFallback(url, background));
+            } else {
+              resolve(false);
+            }
+          }
+        };
+
+        chrome.downloads.onChanged.addListener(onChange);
+      }
+    );
+  });
+}
+
+// Staging folder name within the user's Downloads directory.
+// The native host moves files from here to %TEMP%\ReamletDownloads.
+const STAGING_FOLDER = 'Reamlet';
 
 // After intercepting a navigation, clean up the tab:
 //   success → go back if there's history, otherwise close the tab
@@ -205,7 +332,7 @@ chrome.webRequest.onHeadersReceived.addListener(
 
     chrome.tabs.update(details.tabId, { url: 'about:blank' });
 
-    const ok = await openInReamlet(url, background);
+    const ok = await downloadViaChrome(url, background);
     await resolveTab(details.tabId, url, ok);
   },
   { urls: ['<all_urls>'] },
@@ -240,7 +367,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(
 
     chrome.tabs.update(details.tabId, { url: 'about:blank' });
 
-    const ok = await openInReamlet(url, background);
+    const ok = await downloadViaChrome(url, background);
     await resolveTab(details.tabId, url, ok);
   },
   { url: [{ urlMatches: '\\.pdf(\\?[^#]*)?(?:#.*)?$' }] }
@@ -249,15 +376,19 @@ chrome.webNavigation.onBeforeNavigate.addListener(
 // ── PDF interception: downloads ───────────────────────────────
 
 chrome.downloads.onCreated.addListener(async (item) => {
+  if (reamletDownloadUrls.has(item.url)) return; // Our own download — skip
   if (!interceptEnabled) return;
   if (!isPdfDownload(item)) return;
   if (isDomainDisabled(item.url, item.referrer)) return;
 
   console.log('[Reamlet] Intercepted PDF download:', item.url);
 
+  // Cancel the browser download and re-trigger via downloadViaChrome so the
+  // file path (not the URL) is passed to Reamlet — this handles auth correctly
+  // because Chrome re-fetches the URL with its full session cookies.
   chrome.downloads.cancel(item.id);
 
-  const ok = await openInReamlet(item.url);
+  const ok = await downloadViaChrome(item.url);
   if (!ok) {
     // Fall back: open the URL in a new tab so the browser downloads it
     chrome.tabs.create({ url: item.url });
