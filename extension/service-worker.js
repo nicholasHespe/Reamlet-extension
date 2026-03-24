@@ -162,6 +162,8 @@ function downloadViaChrome(url, background = false) {
       filename = `${STAGING_FOLDER}/download.pdf`;
     }
 
+    console.log('[Reamlet] downloadViaChrome starting — filename:', filename);
+
     chrome.downloads.download(
       { url, saveAs: false, filename, conflictAction: 'uniquify' },
       (downloadId) => {
@@ -172,15 +174,30 @@ function downloadViaChrome(url, background = false) {
           return;
         }
 
+        console.log('[Reamlet] Download started — id:', downloadId, 'filename:', filename);
+
         const onChange = (delta) => {
           if (delta.id !== downloadId) return;
+
+          if (delta.state) {
+            console.log('[Reamlet] Download', downloadId, 'state →', delta.state.current);
+          }
+          if (delta.error) {
+            console.error('[Reamlet] Download', downloadId, 'error →', delta.error.current);
+          }
 
           if (delta.state?.current === 'complete') {
             chrome.downloads.onChanged.removeListener(onChange);
             reamletDownloadUrls.delete(url);
             chrome.downloads.search({ id: downloadId }, async ([item]) => {
-              if (!item?.filename) { resolve(false); return; }
+              if (!item?.filename) {
+                console.error('[Reamlet] Download', downloadId, 'complete but filename missing');
+                resolve(false);
+                return;
+              }
+              console.log('[Reamlet] Download complete — local path:', item.filename);
               const ok = await openInReamlet(item.filename, background);
+              console.log('[Reamlet] openInReamlet result:', ok);
               // Erase from Chrome's download history — the native host moves
               // the file to %TEMP%\ReamletDownloads so no removeFile needed here.
               chrome.downloads.erase({ id: downloadId });
@@ -189,6 +206,7 @@ function downloadViaChrome(url, background = false) {
           } else if (delta.state?.current === 'interrupted') {
             chrome.downloads.onChanged.removeListener(onChange);
             reamletDownloadUrls.delete(url);
+            console.error('[Reamlet] Download', downloadId, 'interrupted — error:', delta.error?.current ?? 'unknown');
             resolve(false);
           }
         };
