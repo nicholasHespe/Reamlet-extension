@@ -17,21 +17,27 @@ let disabledDomains  = new Set();
 let startupComplete = false;
 
 chrome.storage.session.get('startupComplete', (result) => {
-  if (result.startupComplete) startupComplete = true;
+  if (result.startupComplete) {
+    startupComplete = true;
+    console.log('[Reamlet] startupComplete restored from session (mid-session worker restart)');
+  }
 });
 
 // Fresh browser start — wait 5 s for session restore to settle.
 chrome.runtime.onStartup.addListener(() => {
+  console.log('[Reamlet] onStartup — waiting 5 s for session restore');
   setTimeout(() => {
     startupComplete = true;
     chrome.storage.session.set({ startupComplete: true });
+    console.log('[Reamlet] Startup complete — interception enabled');
   }, 5000);
 });
 
 // Extension install/update — no session restore, enable immediately.
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   startupComplete = true;
   chrome.storage.session.set({ startupComplete: true });
+  console.log('[Reamlet] onInstalled (' + details.reason + ') — interception enabled immediately');
 });
 
 // Track the last committed URL for each tab in session storage so we can
@@ -154,8 +160,10 @@ function sendToNativeHost(msg) {
 // Attempt to open a local file path in Reamlet via the native host.
 // Returns true on success, false on any failure.
 async function openInReamlet(filePath, background = false) {
+  console.log('[Reamlet] openInReamlet — sending to native host:', filePath, '| background:', background);
   try {
     const response = await sendToNativeHost({ url: filePath, background });
+    console.log('[Reamlet] Native host response:', JSON.stringify(response));
     if (!response?.ok) {
       console.error('[Reamlet] Host returned error:', response?.error, response?.checked ?? '');
       return false;
@@ -262,7 +270,7 @@ function downloadViaChrome(url, background = false) {
                 resolve(false);
                 return;
               }
-              console.log('[Reamlet] Download complete — local path:', item.filename);
+              console.log('[Reamlet] Download complete — path:', item.filename, '| mime:', item.mime, '| size:', item.fileSize);
               const ok = await openInReamlet(item.filename, background);
               console.log('[Reamlet] openInReamlet result:', ok);
               // Erase from Chrome's download history — the native host moves
@@ -332,11 +340,12 @@ function addBypass(tabId) {
 
 chrome.webRequest.onHeadersReceived.addListener(
   async (details) => {
-    if (!startupComplete) return;
+    if (!startupComplete) { console.log('[Reamlet] onHeadersReceived: startup not complete, skipping', details.url); return; }
     if (!interceptEnabled) return;
     if (details.type !== 'main_frame') return;
     if (bypassTabs.has(details.tabId)) {
       // Consume the flag here — this is the last event in the navigation chain.
+      console.log('[Reamlet] onHeadersReceived: bypass tab, skipping', details.url);
       bypassTabs.delete(details.tabId);
       return;
     }
@@ -345,10 +354,12 @@ chrome.webRequest.onHeadersReceived.addListener(
       (h) => h.name.toLowerCase() === 'content-type'
     )?.value ?? '';
 
+    console.log('[Reamlet] onHeadersReceived:', details.url, '| content-type:', contentType);
+
     if (!contentType.includes('application/pdf')) return;
 
     const url = details.url;
-    if (isDomainDisabled(url, details.initiator)) return;
+    if (isDomainDisabled(url, details.initiator)) { console.log('[Reamlet] onHeadersReceived: domain disabled, skipping', url); return; }
 
     console.log('[Reamlet] Intercepted PDF via content-type:', url);
 
@@ -368,13 +379,16 @@ chrome.webRequest.onHeadersReceived.addListener(
 
 chrome.webNavigation.onBeforeNavigate.addListener(
   async (details) => {
-    if (!startupComplete) return;
+    if (!startupComplete) { console.log('[Reamlet] onBeforeNavigate: startup not complete, skipping', details.url); return; }
     if (!interceptEnabled) return;
-    if (details.frameId !== 0) return;
+    if (details.frameId !== 0) { console.log('[Reamlet] onBeforeNavigate: sub-frame (id=' + details.frameId + '), skipping', details.url); return; }
     if (bypassTabs.has(details.tabId)) {
       // Don't delete here — onHeadersReceived will consume the flag.
+      console.log('[Reamlet] onBeforeNavigate: bypass tab, skipping', details.url);
       return;
     }
+
+    console.log('[Reamlet] onBeforeNavigate: PDF URL matched, frameId=0, tabId=' + details.tabId, details.url);
 
     const url = details.url;
     const tab = await chrome.tabs.get(details.tabId).catch(() => null);
@@ -385,7 +399,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(
       ? tab.openerTabId
       : details.tabId;
     const contextUrl = await getTabContextUrl(contextTabId);
-    if (isDomainDisabled(url, contextUrl)) return;
+    if (isDomainDisabled(url, contextUrl)) { console.log('[Reamlet] onBeforeNavigate: domain disabled, skipping', url); return; }
 
     console.log('[Reamlet] Intercepted PDF via URL pattern:', url);
 
@@ -402,11 +416,12 @@ chrome.webNavigation.onBeforeNavigate.addListener(
 // ── PDF interception: downloads ───────────────────────────────
 
 chrome.downloads.onCreated.addListener(async (item) => {
-  if (!startupComplete) return;
-  if (reamletDownloadUrls.has(item.url)) return; // Our own download — skip
+  if (!startupComplete) { console.log('[Reamlet] onCreated: startup not complete, skipping', item.url); return; }
+  if (reamletDownloadUrls.has(item.url)) { console.log('[Reamlet] onCreated: own download, skipping', item.url); return; }
   if (!interceptEnabled) return;
-  if (!isPdfDownload(item)) return;
-  if (isDomainDisabled(item.url, item.referrer)) return;
+  console.log('[Reamlet] onCreated:', item.url, '| mime:', item.mime, '| filename:', item.filename);
+  if (!isPdfDownload(item)) { console.log('[Reamlet] onCreated: not a PDF, skipping'); return; }
+  if (isDomainDisabled(item.url, item.referrer)) { console.log('[Reamlet] onCreated: domain disabled, skipping'); return; }
 
   console.log('[Reamlet] Intercepted PDF download:', item.url);
 
