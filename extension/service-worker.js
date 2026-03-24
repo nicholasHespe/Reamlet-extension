@@ -127,11 +127,11 @@ function sendToNativeHost(msg) {
   });
 }
 
-// Attempt to open the PDF in Reamlet.
+// Attempt to open a local file path in Reamlet via the native host.
 // Returns true on success, false on any failure.
-async function openInReamlet(url, background = false) {
+async function openInReamlet(filePath, background = false) {
   try {
-    const response = await sendToNativeHost({ url, background });
+    const response = await sendToNativeHost({ url: filePath, background });
     if (!response?.ok) {
       console.error('[Reamlet] Host returned error:', response?.error, response?.checked ?? '');
       return false;
@@ -141,6 +141,65 @@ async function openInReamlet(url, background = false) {
     console.error('[Reamlet] Native messaging failed:', err.message);
     return false;
   }
+}
+
+// URLs of downloads we initiated ourselves — prevents re-interception by onCreated.
+const reamletDownloadUrls = new Set();
+
+// Download a PDF using Chrome (which carries browser session cookies/auth),
+// wait for completion, pass the local file path to Reamlet, then clean up.
+// Returns true if Reamlet was successfully launched with the file.
+function downloadViaChrome(url, background = false) {
+  return new Promise((resolve) => {
+    reamletDownloadUrls.add(url);
+
+    let filename;
+    try {
+      const base = new URL(url).pathname.split('/').pop() || 'download';
+      const name = base.toLowerCase().endsWith('.pdf') ? base : `${base}.pdf`;
+      filename = `Reamlet/${name}`;
+    } catch {
+      filename = 'Reamlet/download.pdf';
+    }
+
+    chrome.downloads.download(
+      { url, saveAs: false, filename, conflictAction: 'uniquify' },
+      (downloadId) => {
+        if (chrome.runtime.lastError || downloadId === undefined) {
+          reamletDownloadUrls.delete(url);
+          console.error('[Reamlet] chrome.downloads.download failed:', chrome.runtime.lastError?.message);
+          resolve(false);
+          return;
+        }
+
+        const onChange = (delta) => {
+          if (delta.id !== downloadId) return;
+
+          if (delta.state?.current === 'complete') {
+            chrome.downloads.onChanged.removeListener(onChange);
+            reamletDownloadUrls.delete(url);
+            chrome.downloads.search({ id: downloadId }, async ([item]) => {
+              if (!item?.filename) { resolve(false); return; }
+              const ok = await openInReamlet(item.filename, background);
+              // Give Reamlet time to read the file (fs.readFileSync is synchronous,
+              // but the process spawn adds a small delay) then clean up.
+              setTimeout(() => {
+                chrome.downloads.removeFile(downloadId, () => {});
+                chrome.downloads.erase({ id: downloadId });
+              }, 5000);
+              resolve(ok);
+            });
+          } else if (delta.state?.current === 'interrupted') {
+            chrome.downloads.onChanged.removeListener(onChange);
+            reamletDownloadUrls.delete(url);
+            resolve(false);
+          }
+        };
+
+        chrome.downloads.onChanged.addListener(onChange);
+      }
+    );
+  });
 }
 
 // After intercepting a navigation, clean up the tab:
@@ -205,7 +264,7 @@ chrome.webRequest.onHeadersReceived.addListener(
 
     chrome.tabs.update(details.tabId, { url: 'about:blank' });
 
-    const ok = await openInReamlet(url, background);
+    const ok = await downloadViaChrome(url, background);
     await resolveTab(details.tabId, url, ok);
   },
   { urls: ['<all_urls>'] },
@@ -240,7 +299,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(
 
     chrome.tabs.update(details.tabId, { url: 'about:blank' });
 
-    const ok = await openInReamlet(url, background);
+    const ok = await downloadViaChrome(url, background);
     await resolveTab(details.tabId, url, ok);
   },
   { url: [{ urlMatches: '\\.pdf(\\?[^#]*)?(?:#.*)?$' }] }
@@ -249,15 +308,19 @@ chrome.webNavigation.onBeforeNavigate.addListener(
 // ── PDF interception: downloads ───────────────────────────────
 
 chrome.downloads.onCreated.addListener(async (item) => {
+  if (reamletDownloadUrls.has(item.url)) return; // Our own download — skip
   if (!interceptEnabled) return;
   if (!isPdfDownload(item)) return;
   if (isDomainDisabled(item.url, item.referrer)) return;
 
   console.log('[Reamlet] Intercepted PDF download:', item.url);
 
+  // Cancel the browser download and re-trigger via downloadViaChrome so the
+  // file path (not the URL) is passed to Reamlet — this handles auth correctly
+  // because Chrome re-fetches the URL with its full session cookies.
   chrome.downloads.cancel(item.id);
 
-  const ok = await openInReamlet(item.url);
+  const ok = await downloadViaChrome(item.url);
   if (!ok) {
     // Fall back: open the URL in a new tab so the browser downloads it
     chrome.tabs.create({ url: item.url });
