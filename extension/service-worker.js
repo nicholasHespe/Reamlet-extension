@@ -143,6 +143,49 @@ async function openInReamlet(filePath, background = false) {
   }
 }
 
+// Native messaging has a 1 MB message limit. Base64 adds ~33% overhead,
+// so cap raw PDF size at 750 KB to stay safely under the limit.
+const FETCH_FALLBACK_MAX_BYTES = 750 * 1024;
+
+// Fallback for cases where chrome.downloads fails (e.g. Content-Disposition: inline).
+// Fetches the URL directly using browser credentials, then passes the raw bytes
+// to the native host which writes them to %TEMP%\ReamletDownloads.
+async function tryFetchFallback(url, background = false) {
+  console.log('[Reamlet] Trying fetch() fallback for:', url);
+  try {
+    const res = await fetch(url, { credentials: 'include' });
+    if (!res.ok) {
+      console.error('[Reamlet] fetch() returned status:', res.status);
+      return false;
+    }
+    const contentType = res.headers.get('content-type') ?? '';
+    if (!contentType.includes('application/pdf')) {
+      console.error('[Reamlet] fetch() got unexpected content-type:', contentType);
+      return false;
+    }
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > FETCH_FALLBACK_MAX_BYTES) {
+      console.warn('[Reamlet] PDF too large for fetch fallback:', buf.byteLength, 'bytes — falling back to browser');
+      return false;
+    }
+    // Encode to base64 without spread (avoids stack overflow on large arrays)
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    const base64 = btoa(binary);
+    console.log('[Reamlet] fetch() got', buf.byteLength, 'bytes — sending to native host');
+    const response = await sendToNativeHost({ bytes: base64, background });
+    if (!response?.ok) {
+      console.error('[Reamlet] Host returned error for bytes message:', response?.error);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('[Reamlet] fetch() fallback error:', err.message);
+    return false;
+  }
+}
+
 // URLs of downloads we initiated ourselves — prevents re-interception by onCreated.
 const reamletDownloadUrls = new Set();
 
@@ -206,8 +249,14 @@ function downloadViaChrome(url, background = false) {
           } else if (delta.state?.current === 'interrupted') {
             chrome.downloads.onChanged.removeListener(onChange);
             reamletDownloadUrls.delete(url);
-            console.error('[Reamlet] Download', downloadId, 'interrupted — error:', delta.error?.current ?? 'unknown');
-            resolve(false);
+            const reason = delta.error?.current ?? 'unknown';
+            console.error('[Reamlet] Download', downloadId, 'interrupted — error:', reason);
+            if (reason === 'SERVER_BAD_CONTENT') {
+              console.log('[Reamlet] SERVER_BAD_CONTENT likely caused by Content-Disposition: inline — trying fetch fallback');
+              resolve(tryFetchFallback(url, background));
+            } else {
+              resolve(false);
+            }
           }
         };
 
