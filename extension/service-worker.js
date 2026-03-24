@@ -157,9 +157,9 @@ function downloadViaChrome(url, background = false) {
     try {
       const base = new URL(url).pathname.split('/').pop() || 'download';
       const name = base.toLowerCase().endsWith('.pdf') ? base : `${base}.pdf`;
-      filename = `Reamlet/${name}`;
+      filename = `${STAGING_FOLDER}/${name}`;
     } catch {
-      filename = 'Reamlet/download.pdf';
+      filename = `${STAGING_FOLDER}/download.pdf`;
     }
 
     chrome.downloads.download(
@@ -181,12 +181,9 @@ function downloadViaChrome(url, background = false) {
             chrome.downloads.search({ id: downloadId }, async ([item]) => {
               if (!item?.filename) { resolve(false); return; }
               const ok = await openInReamlet(item.filename, background);
-              // Give Reamlet time to read the file (fs.readFileSync is synchronous,
-              // but the process spawn adds a small delay) then clean up.
-              setTimeout(() => {
-                chrome.downloads.removeFile(downloadId, () => {});
-                chrome.downloads.erase({ id: downloadId });
-              }, 5000);
+              // Erase from Chrome's download history — the native host moves
+              // the file to %TEMP%\ReamletDownloads so no removeFile needed here.
+              chrome.downloads.erase({ id: downloadId });
               resolve(ok);
             });
           } else if (delta.state?.current === 'interrupted') {
@@ -201,6 +198,10 @@ function downloadViaChrome(url, background = false) {
     );
   });
 }
+
+// Staging folder name within the user's Downloads directory.
+// The native host moves files from here to %TEMP%\ReamletDownloads.
+const STAGING_FOLDER = 'Reamlet';
 
 // After intercepting a navigation, clean up the tab:
 //   success → go back if there's history, otherwise close the tab
