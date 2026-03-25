@@ -221,6 +221,20 @@ async function tryFetchFallback(url, background = false) {
 // URLs of downloads we initiated ourselves — prevents re-interception by onCreated.
 const reamletDownloadUrls = new Set();
 
+// Maps URLs of our in-flight downloads to their desired staging filename.
+// Read by onDeterminingFilename to silently route the file to the staging folder.
+const reamletDownloadFilenames = new Map();
+
+// Suppress the Save As dialog for our own downloads by calling suggest() with
+// the staging path. For all other downloads, return without calling suggest so
+// Chrome's default behavior is preserved.
+chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+  const filename = reamletDownloadFilenames.get(item.url);
+  if (filename) {
+    suggest({ filename, conflictAction: 'uniquify' });
+  }
+});
+
 // Download a PDF using Chrome (which carries browser session cookies/auth),
 // wait for completion, pass the local file path to Reamlet, then clean up.
 // Returns true if Reamlet was successfully launched with the file.
@@ -236,6 +250,7 @@ function downloadViaChrome(url, background = false) {
     } catch {
       filename = `${STAGING_FOLDER}/download.pdf`;
     }
+    reamletDownloadFilenames.set(url, filename);
 
     console.log('[Reamlet] downloadViaChrome starting — filename:', filename);
 
@@ -244,6 +259,7 @@ function downloadViaChrome(url, background = false) {
       (downloadId) => {
         if (chrome.runtime.lastError || downloadId === undefined) {
           reamletDownloadUrls.delete(url);
+          reamletDownloadFilenames.delete(url);
           console.error('[Reamlet] chrome.downloads.download failed:', chrome.runtime.lastError?.message);
           resolve(false);
           return;
@@ -264,6 +280,7 @@ function downloadViaChrome(url, background = false) {
           if (delta.state?.current === 'complete') {
             chrome.downloads.onChanged.removeListener(onChange);
             reamletDownloadUrls.delete(url);
+            reamletDownloadFilenames.delete(url);
             chrome.downloads.search({ id: downloadId }, async ([item]) => {
               if (!item?.filename) {
                 console.error('[Reamlet] Download', downloadId, 'complete but filename missing');
@@ -281,6 +298,7 @@ function downloadViaChrome(url, background = false) {
           } else if (delta.state?.current === 'interrupted') {
             chrome.downloads.onChanged.removeListener(onChange);
             reamletDownloadUrls.delete(url);
+            reamletDownloadFilenames.delete(url);
             const reason = delta.error?.current ?? 'unknown';
             console.error('[Reamlet] Download', downloadId, 'interrupted — error:', reason);
             if (reason === 'SERVER_BAD_CONTENT') {
