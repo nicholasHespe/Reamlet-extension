@@ -230,15 +230,22 @@ const reamletDownloadFilenames = new Map();
 // Chrome's default behavior is preserved.
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
   const filename = reamletDownloadFilenames.get(item.url);
+  console.log('[Reamlet] onDeterminingFilename:', item.url, '| inMap:', !!filename);
   if (filename) {
     suggest({ filename, conflictAction: 'uniquify' });
   }
 });
 
-// Download a PDF using Chrome (which carries browser session cookies/auth),
-// wait for completion, pass the local file path to Reamlet, then clean up.
-// Returns true if Reamlet was successfully launched with the file.
-function downloadViaChrome(url, background = false) {
+// Download a PDF and open it in Reamlet.
+// First tries fetch() — no download dialog, handles session auth via cookies.
+// Falls back to chrome.downloads.download() when fetch fails (e.g. PDF > 750 KB).
+async function downloadViaChrome(url, background = false) {
+  const fetchOk = await tryFetchFallback(url, background);
+  if (fetchOk) return true;
+
+  // fetch() failed — fall back to chrome.downloads.download().
+  // May show Save As dialog if Chrome's "Ask where to save" is enabled.
+  console.log('[Reamlet] fetch() failed, falling back to chrome.downloads.download()');
   return new Promise((resolve) => {
     reamletDownloadUrls.add(url);
 
