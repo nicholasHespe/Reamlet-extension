@@ -10,6 +10,36 @@ const NATIVE_HOST = 'com.reamlet.chromebridge';
 let interceptEnabled = true;
 let disabledDomains  = new Set();
 
+// Block all interception during browser startup/session restore.
+// Set to true once the browser has had time to finish restoring tabs.
+// chrome.storage.session persists across service-worker restarts within a
+// session, so mid-session restarts of the worker re-enable immediately.
+let startupComplete = false;
+
+chrome.storage.session.get('startupComplete', (result) => {
+  if (result.startupComplete) {
+    startupComplete = true;
+    console.log('[Reamlet] startupComplete restored from session (mid-session worker restart)');
+  }
+});
+
+// Fresh browser start — wait 5 s for session restore to settle.
+chrome.runtime.onStartup.addListener(() => {
+  console.log('[Reamlet] onStartup — waiting 5 s for session restore');
+  setTimeout(() => {
+    startupComplete = true;
+    chrome.storage.session.set({ startupComplete: true });
+    console.log('[Reamlet] Startup complete — interception enabled');
+  }, 5000);
+});
+
+// Extension install/update — no session restore, enable immediately.
+chrome.runtime.onInstalled.addListener((details) => {
+  startupComplete = true;
+  chrome.storage.session.set({ startupComplete: true });
+  console.log('[Reamlet] onInstalled (' + details.reason + ') — interception enabled immediately');
+});
+
 // Track the last committed URL for each tab in session storage so we can
 // identify the browsing context even during mid-navigation (when tab.url is empty).
 // chrome.storage.session persists across service worker restarts.
@@ -130,8 +160,10 @@ function sendToNativeHost(msg) {
 // Attempt to open a local file path in Reamlet via the native host.
 // Returns true on success, false on any failure.
 async function openInReamlet(filePath, background = false) {
+  console.log('[Reamlet] openInReamlet — sending to native host:', filePath, '| background:', background);
   try {
     const response = await sendToNativeHost({ url: filePath, background });
+    console.log('[Reamlet] Native host response:', JSON.stringify(response));
     if (!response?.ok) {
       console.error('[Reamlet] Host returned error:', response?.error, response?.checked ?? '');
       return false;
@@ -189,10 +221,31 @@ async function tryFetchFallback(url, background = false) {
 // URLs of downloads we initiated ourselves — prevents re-interception by onCreated.
 const reamletDownloadUrls = new Set();
 
-// Download a PDF using Chrome (which carries browser session cookies/auth),
-// wait for completion, pass the local file path to Reamlet, then clean up.
-// Returns true if Reamlet was successfully launched with the file.
-function downloadViaChrome(url, background = false) {
+// Maps URLs of our in-flight downloads to their desired staging filename.
+// Read by onDeterminingFilename to silently route the file to the staging folder.
+const reamletDownloadFilenames = new Map();
+
+// Suppress the Save As dialog for our own downloads by calling suggest() with
+// the staging path. For all other downloads, return without calling suggest so
+// Chrome's default behavior is preserved.
+chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+  const filename = reamletDownloadFilenames.get(item.url);
+  console.log('[Reamlet] onDeterminingFilename:', item.url, '| inMap:', !!filename);
+  if (filename) {
+    suggest({ filename, conflictAction: 'uniquify' });
+  }
+});
+
+// Download a PDF and open it in Reamlet.
+// First tries fetch() — no download dialog, handles session auth via cookies.
+// Falls back to chrome.downloads.download() when fetch fails (e.g. PDF > 750 KB).
+async function downloadViaChrome(url, background = false) {
+  const fetchOk = await tryFetchFallback(url, background);
+  if (fetchOk) return true;
+
+  // fetch() failed — fall back to chrome.downloads.download().
+  // May show Save As dialog if Chrome's "Ask where to save" is enabled.
+  console.log('[Reamlet] fetch() failed, falling back to chrome.downloads.download()');
   return new Promise((resolve) => {
     reamletDownloadUrls.add(url);
 
@@ -204,6 +257,7 @@ function downloadViaChrome(url, background = false) {
     } catch {
       filename = `${STAGING_FOLDER}/download.pdf`;
     }
+    reamletDownloadFilenames.set(url, filename);
 
     console.log('[Reamlet] downloadViaChrome starting — filename:', filename);
 
@@ -212,6 +266,7 @@ function downloadViaChrome(url, background = false) {
       (downloadId) => {
         if (chrome.runtime.lastError || downloadId === undefined) {
           reamletDownloadUrls.delete(url);
+          reamletDownloadFilenames.delete(url);
           console.error('[Reamlet] chrome.downloads.download failed:', chrome.runtime.lastError?.message);
           resolve(false);
           return;
@@ -232,13 +287,14 @@ function downloadViaChrome(url, background = false) {
           if (delta.state?.current === 'complete') {
             chrome.downloads.onChanged.removeListener(onChange);
             reamletDownloadUrls.delete(url);
+            reamletDownloadFilenames.delete(url);
             chrome.downloads.search({ id: downloadId }, async ([item]) => {
               if (!item?.filename) {
                 console.error('[Reamlet] Download', downloadId, 'complete but filename missing');
                 resolve(false);
                 return;
               }
-              console.log('[Reamlet] Download complete — local path:', item.filename);
+              console.log('[Reamlet] Download complete — path:', item.filename, '| mime:', item.mime, '| size:', item.fileSize);
               const ok = await openInReamlet(item.filename, background);
               console.log('[Reamlet] openInReamlet result:', ok);
               // Erase from Chrome's download history — the native host moves
@@ -249,6 +305,7 @@ function downloadViaChrome(url, background = false) {
           } else if (delta.state?.current === 'interrupted') {
             chrome.downloads.onChanged.removeListener(onChange);
             reamletDownloadUrls.delete(url);
+            reamletDownloadFilenames.delete(url);
             const reason = delta.error?.current ?? 'unknown';
             console.error('[Reamlet] Download', downloadId, 'interrupted — error:', reason);
             if (reason === 'SERVER_BAD_CONTENT') {
@@ -308,10 +365,12 @@ function addBypass(tabId) {
 
 chrome.webRequest.onHeadersReceived.addListener(
   async (details) => {
+    if (!startupComplete) { console.log('[Reamlet] onHeadersReceived: startup not complete, skipping', details.url); return; }
     if (!interceptEnabled) return;
     if (details.type !== 'main_frame') return;
     if (bypassTabs.has(details.tabId)) {
       // Consume the flag here — this is the last event in the navigation chain.
+      console.log('[Reamlet] onHeadersReceived: bypass tab, skipping', details.url);
       bypassTabs.delete(details.tabId);
       return;
     }
@@ -320,10 +379,12 @@ chrome.webRequest.onHeadersReceived.addListener(
       (h) => h.name.toLowerCase() === 'content-type'
     )?.value ?? '';
 
+    console.log('[Reamlet] onHeadersReceived:', details.url, '| content-type:', contentType);
+
     if (!contentType.includes('application/pdf')) return;
 
     const url = details.url;
-    if (isDomainDisabled(url, details.initiator)) return;
+    if (isDomainDisabled(url, details.initiator)) { console.log('[Reamlet] onHeadersReceived: domain disabled, skipping', url); return; }
 
     console.log('[Reamlet] Intercepted PDF via content-type:', url);
 
@@ -343,12 +404,16 @@ chrome.webRequest.onHeadersReceived.addListener(
 
 chrome.webNavigation.onBeforeNavigate.addListener(
   async (details) => {
+    if (!startupComplete) { console.log('[Reamlet] onBeforeNavigate: startup not complete, skipping', details.url); return; }
     if (!interceptEnabled) return;
-    if (details.frameId !== 0) return;
+    if (details.frameId !== 0) { console.log('[Reamlet] onBeforeNavigate: sub-frame (id=' + details.frameId + '), skipping', details.url); return; }
     if (bypassTabs.has(details.tabId)) {
       // Don't delete here — onHeadersReceived will consume the flag.
+      console.log('[Reamlet] onBeforeNavigate: bypass tab, skipping', details.url);
       return;
     }
+
+    console.log('[Reamlet] onBeforeNavigate: PDF URL matched, frameId=0, tabId=' + details.tabId, details.url);
 
     const url = details.url;
     const tab = await chrome.tabs.get(details.tabId).catch(() => null);
@@ -359,7 +424,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(
       ? tab.openerTabId
       : details.tabId;
     const contextUrl = await getTabContextUrl(contextTabId);
-    if (isDomainDisabled(url, contextUrl)) return;
+    if (isDomainDisabled(url, contextUrl)) { console.log('[Reamlet] onBeforeNavigate: domain disabled, skipping', url); return; }
 
     console.log('[Reamlet] Intercepted PDF via URL pattern:', url);
 
@@ -376,21 +441,18 @@ chrome.webNavigation.onBeforeNavigate.addListener(
 // ── PDF interception: downloads ───────────────────────────────
 
 chrome.downloads.onCreated.addListener(async (item) => {
-  if (reamletDownloadUrls.has(item.url)) return; // Our own download — skip
+  if (!startupComplete) { console.log('[Reamlet] onCreated: startup not complete, skipping', item.url); return; }
+  if (reamletDownloadUrls.has(item.url)) { console.log('[Reamlet] onCreated: own download, skipping', item.url); return; }
   if (!interceptEnabled) return;
-  if (!isPdfDownload(item)) return;
-  if (isDomainDisabled(item.url, item.referrer)) return;
+  console.log('[Reamlet] onCreated:', item.url, '| mime:', item.mime, '| filename:', item.filename);
+  if (!isPdfDownload(item)) { console.log('[Reamlet] onCreated: not a PDF, skipping'); return; }
+  if (isDomainDisabled(item.url, item.referrer)) { console.log('[Reamlet] onCreated: domain disabled, skipping'); return; }
 
   console.log('[Reamlet] Intercepted PDF download:', item.url);
 
-  // Cancel the browser download and re-trigger via downloadViaChrome so the
-  // file path (not the URL) is passed to Reamlet — this handles auth correctly
-  // because Chrome re-fetches the URL with its full session cookies.
-  chrome.downloads.cancel(item.id);
-
-  const ok = await downloadViaChrome(item.url);
-  if (!ok) {
-    // Fall back: open the URL in a new tab so the browser downloads it
-    chrome.tabs.create({ url: item.url });
+  const ok = await openInReamlet(item.url);
+  if (ok) {
+    chrome.downloads.cancel(item.id);
   }
+  // If !ok, the existing download proceeds normally — no new tab, no loop
 });
