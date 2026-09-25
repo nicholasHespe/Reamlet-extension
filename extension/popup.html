@@ -33,11 +33,16 @@
 
     .row + .row { margin-top: 8px; }
 
+    /* Setting labels keep their full width so the popup grows to fit them;
+       only the site hostname, which can be arbitrarily long, is truncated. */
     .label {
       color: #c8c8c8;
+      white-space: nowrap;
+    }
+
+    .label.truncate {
       overflow: hidden;
       text-overflow: ellipsis;
-      white-space: nowrap;
     }
 
     hr {
@@ -110,7 +115,7 @@
   <div id="domainSection" style="display:none">
     <hr />
     <div class="row">
-      <span class="label" id="domainLabel"></span>
+      <span class="label truncate" id="domainLabel"></span>
       <label class="toggle">
         <input type="checkbox" id="domainToggle" />
         <span class="slider"></span>
