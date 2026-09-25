@@ -327,53 +327,122 @@ async function downloadViaChrome(url, background = false) {
 // The native host moves files from here to %TEMP%\ReamletDownloads.
 const STAGING_FOLDER = 'Reamlet';
 
-// After intercepting a navigation, clean up the tab:
-//   success → go back if there's history, otherwise close the tab
+// ── Tab jobs ──────────────────────────────────────────────────
+//
+// webRequest listeners cannot block in MV3, so by the time we react to a PDF
+// navigation the browser may already have committed it (the PDF shows in the
+// tab and gets its own history entry). A .pdf URL served as application/pdf
+// also triggers both interceptors below for the same navigation.
+//
+// To keep that from opening the PDF more than once, every intercepted tab is
+// tracked here from the moment it is claimed until it has been restored, and
+// the interceptors ignore any PDF navigation in a tab that already has a job.
+//
+//   'opening'   — tab parked on about:blank while the PDF is sent to Reamlet
+//   'restoring' — going back through history to the page before the PDF
+//   'bypass'    — handing the PDF back to the browser after a failed open
+const tabJobs = new Map();
+
+// Safety net for the 'restoring' and 'bypass' phases in case the navigation
+// we are waiting for never reports back.
+const JOB_SETTLE_TIMEOUT_MS = 15000;
+
+// If the tab already has a job, record this PDF navigation as part of it (so
+// that landing on it again while restoring is recognised) and return true.
+function isTabBusy(tabId, url) {
+  const job = tabJobs.get(tabId);
+  if (!job) return false;
+  job.pdfUrls.add(url);
+  return true;
+}
+
+// Must be called synchronously in the listener, after isTabBusy() and before
+// any await, so that the first interceptor to see a navigation owns it.
+function claimTab(tabId, url) {
+  tabJobs.set(tabId, { phase: 'opening', pdfUrls: new Set([url]), timer: null });
+}
+
+function releaseTab(tabId) {
+  const job = tabJobs.get(tabId);
+  if (!job) return;
+  clearTimeout(job.timer);
+  tabJobs.delete(tabId);
+}
+
+function setPhase(tabId, phase) {
+  const job = tabJobs.get(tabId);
+  if (!job) return;
+  job.phase = phase;
+  clearTimeout(job.timer);
+  job.timer = setTimeout(() => releaseTab(tabId), JOB_SETTLE_TIMEOUT_MS);
+}
+
+// Park the tab, open the PDF in Reamlet, then put the tab back:
+//   success → return to the page the PDF was opened from, or close the tab
+//             if it was opened just for the PDF
 //   failure → navigate to the original URL so the browser handles it
-async function resolveTab(tabId, originalUrl, success) {
-  if (success) {
-    chrome.tabs.goBack(tabId, () => {
-      if (chrome.runtime.lastError) {
-        // No history — tab was opened just for this PDF, close it
-        chrome.tabs.remove(tabId);
-      }
-    });
+async function handleInterceptedTab(tabId, url, background) {
+  // May fail if the tab has already been closed — the job is then released
+  // by onRemoved and the result below is discarded.
+  await chrome.tabs.update(tabId, { url: 'about:blank' }).catch(() => {});
+
+  const ok = await downloadViaChrome(url, background);
+  if (!tabJobs.has(tabId)) return;
+
+  if (ok) {
+    setPhase(tabId, 'restoring');
+    stepBack(tabId);
   } else {
-    // Mark this tab so the next navigation event doesn't re-intercept it
-    addBypass(tabId);
-    chrome.tabs.update(tabId, { url: originalUrl }, () => {
-      if (chrome.runtime.lastError) {
-        // Tab was already closed — clean up immediately
-        bypassTabs.delete(tabId);
-      }
-    });
+    setPhase(tabId, 'bypass');
+    chrome.tabs.update(tabId, { url }).catch(() => releaseTab(tabId));
   }
 }
 
-// Tabs currently being handed back to the browser after a failed intercept.
-// Consumed by onHeadersReceived (the last event in the navigation chain) so
-// that both onBeforeNavigate and onHeadersReceived are covered by one flag.
-const bypassTabs = new Set();
-
-function addBypass(tabId) {
-  bypassTabs.add(tabId);
-  // Safety cleanup in case onHeadersReceived never fires (e.g. non-HTTP URL).
-  setTimeout(() => bypassTabs.delete(tabId), 15000);
+// Go back one history entry. The onCommitted listener below calls this again
+// if we land on the PDF itself or on the about:blank placeholder. When there
+// is no entry to go back to, the tab was opened just for the PDF — close it.
+function stepBack(tabId) {
+  chrome.tabs.goBack(tabId).catch(() => {
+    releaseTab(tabId);
+    chrome.tabs.remove(tabId).catch(() => {});
+  });
 }
+
+chrome.webNavigation.onCommitted.addListener((details) => {
+  if (details.frameId !== 0) return;
+  const job = tabJobs.get(details.tabId);
+  if (!job) return;
+
+  if (job.phase === 'restoring') {
+    if (details.url === 'about:blank' || job.pdfUrls.has(details.url)) {
+      console.log('[Reamlet] Restoring tab', details.tabId, '— landed on', details.url, ', going back again');
+      stepBack(details.tabId);
+    } else {
+      releaseTab(details.tabId);
+    }
+  } else if (job.phase === 'bypass' && details.url !== 'about:blank') {
+    releaseTab(details.tabId);
+  }
+});
+
+// A bypass navigation that never commits (e.g. the server sends the PDF as an
+// attachment, which becomes a download) ends here instead.
+chrome.webNavigation.onErrorOccurred.addListener((details) => {
+  if (details.frameId !== 0) return;
+  if (tabJobs.get(details.tabId)?.phase === 'bypass' && details.url !== 'about:blank') {
+    releaseTab(details.tabId);
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => releaseTab(tabId));
 
 // ── PDF interception: content-type ────────────────────────────
 
 chrome.webRequest.onHeadersReceived.addListener(
-  async (details) => {
+  (details) => {
     if (!startupComplete) { console.log('[Reamlet] onHeadersReceived: startup not complete, skipping', details.url); return; }
     if (!interceptEnabled) return;
-    if (details.type !== 'main_frame') return;
-    if (bypassTabs.has(details.tabId)) {
-      // Consume the flag here — this is the last event in the navigation chain.
-      console.log('[Reamlet] onHeadersReceived: bypass tab, skipping', details.url);
-      bypassTabs.delete(details.tabId);
-      return;
-    }
+    if (details.type !== 'main_frame' || details.tabId < 0) return;
 
     const contentType = (details.responseHeaders ?? []).find(
       (h) => h.name.toLowerCase() === 'content-type'
@@ -384,17 +453,15 @@ chrome.webRequest.onHeadersReceived.addListener(
     if (!contentType.includes('application/pdf')) return;
 
     const url = details.url;
+    if (isTabBusy(details.tabId, url)) { console.log('[Reamlet] onHeadersReceived: tab already being handled, skipping', url); return; }
     if (isDomainDisabled(url, details.initiator)) { console.log('[Reamlet] onHeadersReceived: domain disabled, skipping', url); return; }
+    claimTab(details.tabId, url);
 
     console.log('[Reamlet] Intercepted PDF via content-type:', url);
 
-    const tab = await chrome.tabs.get(details.tabId).catch(() => null);
-    const background = tab ? !tab.active : false;
-
-    chrome.tabs.update(details.tabId, { url: 'about:blank' });
-
-    const ok = await downloadViaChrome(url, background);
-    await resolveTab(details.tabId, url, ok);
+    chrome.tabs.get(details.tabId)
+      .then((tab) => !tab.active, () => false)
+      .then((background) => handleInterceptedTab(details.tabId, url, background));
   },
   { urls: ['<all_urls>'] },
   ['responseHeaders']
@@ -407,15 +474,15 @@ chrome.webNavigation.onBeforeNavigate.addListener(
     if (!startupComplete) { console.log('[Reamlet] onBeforeNavigate: startup not complete, skipping', details.url); return; }
     if (!interceptEnabled) return;
     if (details.frameId !== 0) { console.log('[Reamlet] onBeforeNavigate: sub-frame (id=' + details.frameId + '), skipping', details.url); return; }
-    if (bypassTabs.has(details.tabId)) {
-      // Don't delete here — onHeadersReceived will consume the flag.
-      console.log('[Reamlet] onBeforeNavigate: bypass tab, skipping', details.url);
-      return;
-    }
-
-    console.log('[Reamlet] onBeforeNavigate: PDF URL matched, frameId=0, tabId=' + details.tabId, details.url);
 
     const url = details.url;
+    if (isTabBusy(details.tabId, url)) { console.log('[Reamlet] onBeforeNavigate: tab already being handled, skipping', url); return; }
+    // Claim before awaiting anything, so onHeadersReceived for this same
+    // navigation sees the tab as taken. Released again if the domain is disabled.
+    claimTab(details.tabId, url);
+
+    console.log('[Reamlet] onBeforeNavigate: PDF URL matched, frameId=0, tabId=' + details.tabId, url);
+
     const tab = await chrome.tabs.get(details.tabId).catch(() => null);
 
     // For new tabs (url is empty), the opener tab is the browsing context.
@@ -424,16 +491,16 @@ chrome.webNavigation.onBeforeNavigate.addListener(
       ? tab.openerTabId
       : details.tabId;
     const contextUrl = await getTabContextUrl(contextTabId);
-    if (isDomainDisabled(url, contextUrl)) { console.log('[Reamlet] onBeforeNavigate: domain disabled, skipping', url); return; }
+    if (isDomainDisabled(url, contextUrl)) {
+      console.log('[Reamlet] onBeforeNavigate: domain disabled, skipping', url);
+      releaseTab(details.tabId);
+      return;
+    }
 
     console.log('[Reamlet] Intercepted PDF via URL pattern:', url);
 
     const background = tab ? !tab.active : false;
-
-    chrome.tabs.update(details.tabId, { url: 'about:blank' });
-
-    const ok = await downloadViaChrome(url, background);
-    await resolveTab(details.tabId, url, ok);
+    await handleInterceptedTab(details.tabId, url, background);
   },
   { url: [{ urlMatches: '\\.pdf(\\?[^#]*)?(?:#.*)?$' }] }
 );
