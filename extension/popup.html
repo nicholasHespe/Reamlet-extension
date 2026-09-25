@@ -31,6 +31,8 @@
       gap: 10px;
     }
 
+    .row + .row { margin-top: 8px; }
+
     .label {
       color: #c8c8c8;
       overflow: hidden;
@@ -95,6 +97,13 @@
     <span class="label">Intercept PDFs</span>
     <label class="toggle">
       <input type="checkbox" id="globalToggle" />
+      <span class="slider"></span>
+    </label>
+  </div>
+  <div class="row" title="When off, PDFs that can only be downloaded with your browser sign-in open in the browser instead.">
+    <span class="label">Include PDFs behind sign-in</span>
+    <label class="toggle">
+      <input type="checkbox" id="authToggle" />
       <span class="slider"></span>
     </label>
   </div>
