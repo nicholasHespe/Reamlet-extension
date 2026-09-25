@@ -10,6 +10,11 @@ const NATIVE_HOST = 'com.reamlet.chromebridge';
 let interceptEnabled = true;
 let disabledDomains  = new Set();
 
+// When false, PDFs are only opened in Reamlet if they can be fetched without
+// the browser's cookies/session; anything that needs sign-in is left for the
+// browser to open normally.
+let authPdfsEnabled = true;
+
 // Block all interception during browser startup/session restore.
 // Set to true once the browser has had time to finish restoring tabs.
 // chrome.storage.session persists across service-worker restarts within a
@@ -70,13 +75,14 @@ function getTabContextUrl(tabId) {
   });
 }
 
-chrome.storage.local.get(['interceptEnabled', 'disabledDomains'], (result) => {
+chrome.storage.local.get(['interceptEnabled', 'disabledDomains', 'authPdfsEnabled'], (result) => {
   if (result.interceptEnabled !== undefined) {
     interceptEnabled = result.interceptEnabled;
   }
   if (Array.isArray(result.disabledDomains)) {
     disabledDomains = new Set(result.disabledDomains);
   }
+  authPdfsEnabled = result.authPdfsEnabled !== false;
   updateBadge();
 });
 
@@ -88,6 +94,10 @@ chrome.storage.onChanged.addListener((changes) => {
   if ('disabledDomains' in changes) {
     disabledDomains = new Set(changes.disabledDomains.newValue ?? []);
     console.log('[Reamlet] Site settings updated. Disabled domains:', [...disabledDomains]);
+  }
+  if ('authPdfsEnabled' in changes) {
+    authPdfsEnabled = changes.authPdfsEnabled.newValue !== false;
+    console.log('[Reamlet] PDFs that need sign-in:', authPdfsEnabled ? 'opened in Reamlet' : 'left to the browser');
   }
 });
 
@@ -177,28 +187,50 @@ async function openInReamlet(filePath, background = false) {
 
 // Native messaging has a 1 MB message limit. Base64 adds ~33% overhead,
 // so cap raw PDF size at 750 KB to stay safely under the limit.
-const FETCH_FALLBACK_MAX_BYTES = 750 * 1024;
+const FETCH_MAX_BYTES = 750 * 1024;
 
-// Fallback for cases where chrome.downloads fails (e.g. Content-Disposition: inline).
-// Fetches the URL directly using browser credentials, then passes the raw bytes
-// to the native host which writes them to %TEMP%\ReamletDownloads.
-async function tryFetchFallback(url, background = false) {
-  console.log('[Reamlet] Trying fetch() fallback for:', url);
+// Fetch a PDF with fetch() and pass the raw bytes to the native host, which
+// writes them to %TEMP%\ReamletDownloads. No download dialog is involved.
+//
+// credentials: 'include' uses the browser's session cookies (SharePoint,
+// Gmail, intranets); 'omit' fetches the URL as an anonymous client would.
+//
+// Resolves to one of:
+//   'opened'      — sent to Reamlet
+//   'unavailable' — the URL did not return a PDF with these credentials
+//                   (e.g. 401/403 or a redirect to a sign-in page)
+//   'too-large'   — a PDF, but too big for a native message
+//   'host-error'  — the native host could not open it
+async function fetchIntoReamlet(url, background, credentials) {
+  console.log('[Reamlet] fetch() (credentials: ' + credentials + '):', url);
+  let res;
   try {
-    const res = await fetch(url, { credentials: 'include' });
-    if (!res.ok) {
-      console.error('[Reamlet] fetch() returned status:', res.status);
-      return false;
-    }
-    const contentType = res.headers.get('content-type') ?? '';
-    if (!contentType.includes('application/pdf')) {
-      console.error('[Reamlet] fetch() got unexpected content-type:', contentType);
-      return false;
-    }
+    res = await fetch(url, { credentials });
+  } catch (err) {
+    console.error('[Reamlet] fetch() error:', err.message);
+    return 'unavailable';
+  }
+  if (!res.ok) {
+    console.error('[Reamlet] fetch() returned status:', res.status);
+    return 'unavailable';
+  }
+  const contentType = res.headers.get('content-type') ?? '';
+  if (!contentType.includes('application/pdf')) {
+    console.error('[Reamlet] fetch() got unexpected content-type:', contentType);
+    return 'unavailable';
+  }
+  const declaredLength = Number(res.headers.get('content-length'));
+  if (declaredLength > FETCH_MAX_BYTES) {
+    console.warn('[Reamlet] PDF too large for fetch path:', declaredLength, 'bytes');
+    res.body?.cancel().catch(() => {});
+    return 'too-large';
+  }
+
+  try {
     const buf = await res.arrayBuffer();
-    if (buf.byteLength > FETCH_FALLBACK_MAX_BYTES) {
-      console.warn('[Reamlet] PDF too large for fetch fallback:', buf.byteLength, 'bytes — falling back to browser');
-      return false;
+    if (buf.byteLength > FETCH_MAX_BYTES) {
+      console.warn('[Reamlet] PDF too large for fetch path:', buf.byteLength, 'bytes');
+      return 'too-large';
     }
     // Encode to base64 without spread (avoids stack overflow on large arrays)
     const bytes = new Uint8Array(buf);
@@ -209,12 +241,12 @@ async function tryFetchFallback(url, background = false) {
     const response = await sendToNativeHost({ bytes: base64, background });
     if (!response?.ok) {
       console.error('[Reamlet] Host returned error for bytes message:', response?.error);
-      return false;
+      return 'host-error';
     }
-    return true;
+    return 'opened';
   } catch (err) {
-    console.error('[Reamlet] fetch() fallback error:', err.message);
-    return false;
+    console.error('[Reamlet] fetch() path error:', err.message);
+    return 'host-error';
   }
 }
 
@@ -236,16 +268,26 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
   }
 });
 
-// Download a PDF and open it in Reamlet.
+// Download a PDF and open it in Reamlet. Returns false if the browser should
+// open it instead.
 // First tries fetch() — no download dialog, handles session auth via cookies.
 // Falls back to chrome.downloads.download() when fetch fails (e.g. PDF > 750 KB).
+//
+// With authPdfsEnabled off, the fetch is made without cookies. A PDF that
+// can't be fetched that way needs the user's session, so it is left to the
+// browser rather than downloaded with that session.
 async function downloadViaChrome(url, background = false) {
-  const fetchOk = await tryFetchFallback(url, background);
-  if (fetchOk) return true;
+  const credentials = authPdfsEnabled ? 'include' : 'omit';
+  const result = await fetchIntoReamlet(url, background, credentials);
+  if (result === 'opened') return true;
+  if (result === 'unavailable' && !authPdfsEnabled) {
+    console.log('[Reamlet] PDF needs sign-in and those are disabled — leaving it to the browser:', url);
+    return false;
+  }
 
   // fetch() failed — fall back to chrome.downloads.download().
   // May show Save As dialog if Chrome's "Ask where to save" is enabled.
-  console.log('[Reamlet] fetch() failed, falling back to chrome.downloads.download()');
+  console.log('[Reamlet] fetch() failed (' + result + '), falling back to chrome.downloads.download()');
   return new Promise((resolve) => {
     reamletDownloadUrls.add(url);
 
@@ -310,7 +352,7 @@ async function downloadViaChrome(url, background = false) {
             console.error('[Reamlet] Download', downloadId, 'interrupted — error:', reason);
             if (reason === 'SERVER_BAD_CONTENT') {
               console.log('[Reamlet] SERVER_BAD_CONTENT likely caused by Content-Disposition: inline — trying fetch fallback');
-              resolve(tryFetchFallback(url, background));
+              resolve(fetchIntoReamlet(url, background, credentials).then((r) => r === 'opened'));
             } else {
               resolve(false);
             }
