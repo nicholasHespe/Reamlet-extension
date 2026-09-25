@@ -21,7 +21,7 @@ let authPdfsEnabled = true;
 // session, so mid-session restarts of the worker re-enable immediately.
 let startupComplete = false;
 
-chrome.storage.session.get('startupComplete', (result) => {
+const startupLoaded = chrome.storage.session.get('startupComplete').then((result) => {
   if (result.startupComplete) {
     startupComplete = true;
     console.log('[Reamlet] startupComplete restored from session (mid-session worker restart)');
@@ -35,6 +35,7 @@ chrome.runtime.onStartup.addListener(() => {
     startupComplete = true;
     chrome.storage.session.set({ startupComplete: true });
     console.log('[Reamlet] Startup complete — interception enabled');
+    syncInterceptRule();
   }, 5000);
 });
 
@@ -43,6 +44,7 @@ chrome.runtime.onInstalled.addListener((details) => {
   startupComplete = true;
   chrome.storage.session.set({ startupComplete: true });
   console.log('[Reamlet] onInstalled (' + details.reason + ') — interception enabled immediately');
+  syncInterceptRule();
 });
 
 // Track the last committed URL for each tab in session storage so we can
@@ -75,7 +77,7 @@ function getTabContextUrl(tabId) {
   });
 }
 
-chrome.storage.local.get(['interceptEnabled', 'disabledDomains', 'authPdfsEnabled'], (result) => {
+const settingsLoaded = chrome.storage.local.get(['interceptEnabled', 'disabledDomains', 'authPdfsEnabled']).then((result) => {
   if (result.interceptEnabled !== undefined) {
     interceptEnabled = result.interceptEnabled;
   }
@@ -86,14 +88,24 @@ chrome.storage.local.get(['interceptEnabled', 'disabledDomains', 'authPdfsEnable
   updateBadge();
 });
 
-chrome.storage.onChanged.addListener((changes) => {
+// Session rules outlive a service-worker restart, so bring them in line with
+// the settings each time the worker starts.
+Promise.all([startupLoaded, settingsLoaded]).then(() => {
+  removeStaleBypassRules();
+  syncInterceptRule();
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
   if ('interceptEnabled' in changes) {
     interceptEnabled = changes.interceptEnabled.newValue;
     updateBadge();
+    syncInterceptRule();
   }
   if ('disabledDomains' in changes) {
     disabledDomains = new Set(changes.disabledDomains.newValue ?? []);
     console.log('[Reamlet] Site settings updated. Disabled domains:', [...disabledDomains]);
+    syncInterceptRule();
   }
   if ('authPdfsEnabled' in changes) {
     authPdfsEnabled = changes.authPdfsEnabled.newValue !== false;
@@ -194,6 +206,8 @@ const FETCH_MAX_BYTES = 750 * 1024;
 //
 // credentials: 'include' uses the browser's session cookies (SharePoint,
 // Gmail, intranets); 'omit' fetches the URL as an anonymous client would.
+// pending: a fetch() of this URL already in flight, used instead of
+// starting a new one.
 //
 // Resolves to one of:
 //   'opened'      — sent to Reamlet
@@ -201,11 +215,11 @@ const FETCH_MAX_BYTES = 750 * 1024;
 //                   (e.g. 401/403 or a redirect to a sign-in page)
 //   'too-large'   — a PDF, but too big for a native message
 //   'host-error'  — the native host could not open it
-async function fetchIntoReamlet(url, background, credentials) {
-  console.log('[Reamlet] fetch() (credentials: ' + credentials + '):', url);
+async function fetchIntoReamlet(url, background, credentials, pending = null) {
+  console.log('[Reamlet] fetch() (credentials: ' + credentials + (pending ? ', prefetched' : '') + '):', url);
   let res;
   try {
-    res = await fetch(url, { credentials });
+    res = await (pending ?? fetch(url, { credentials }));
   } catch (err) {
     console.error('[Reamlet] fetch() error:', err.message);
     return 'unavailable';
@@ -269,16 +283,16 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
 });
 
 // Download a PDF and open it in Reamlet. Returns false if the browser should
-// open it instead.
+// open it instead. prefetch: an in-flight fetch of url (see onBeforeNavigate).
 // First tries fetch() — no download dialog, handles session auth via cookies.
 // Falls back to chrome.downloads.download() when fetch fails (e.g. PDF > 750 KB).
 //
 // With authPdfsEnabled off, the fetch is made without cookies. A PDF that
 // can't be fetched that way needs the user's session, so it is left to the
 // browser rather than downloaded with that session.
-async function downloadViaChrome(url, background = false) {
-  const credentials = authPdfsEnabled ? 'include' : 'omit';
-  const result = await fetchIntoReamlet(url, background, credentials);
+async function downloadViaChrome(url, background = false, prefetch = null) {
+  const credentials = prefetch?.credentials ?? (authPdfsEnabled ? 'include' : 'omit');
+  const result = await fetchIntoReamlet(url, background, credentials, prefetch?.response);
   if (result === 'opened') return true;
   if (result === 'unavailable' && !authPdfsEnabled) {
     console.log('[Reamlet] PDF needs sign-in and those are disabled — leaving it to the browser:', url);
@@ -369,190 +383,257 @@ async function downloadViaChrome(url, background = false) {
 // The native host moves files from here to %TEMP%\ReamletDownloads.
 const STAGING_FOLDER = 'Reamlet';
 
-// ── Tab jobs ──────────────────────────────────────────────────
+// ── Interception rule ─────────────────────────────────────────
 //
-// webRequest listeners cannot block in MV3, so by the time we react to a PDF
-// navigation the browser may already have committed it (the PDF shows in the
-// tab and gets its own history entry). A .pdf URL served as application/pdf
-// also triggers both interceptors below for the same navigation.
+// webRequest and webNavigation listeners cannot block in MV3, so reacting to
+// them always lets the browser start showing the PDF first. Instead, a
+// declarativeNetRequest session rule marks every main-frame PDF response as
+// an attachment. Chrome applies it in the network stack before anything is
+// rendered, so the navigation turns into a download: the tab stays on the
+// page it was on, and a tab opened just for the PDF is closed by Chrome.
+// downloads.onCreated below then cancels that download and opens the PDF in
+// Reamlet.
 //
-// To keep that from opening the PDF more than once, every intercepted tab is
-// tracked here from the moment it is claimed until it has been restored, and
-// the interceptors ignore any PDF navigation in a tab that already has a job.
-//
-//   'opening'   — tab parked on about:blank while the PDF is sent to Reamlet
-//   'restoring' — going back through history to the page before the PDF
-//   'bypass'    — handing the PDF back to the browser after a failed open
-const tabJobs = new Map();
+// Session rules are cleared when the browser restarts and the rule is only
+// added once startup has completed, so restored tabs are never intercepted.
+// PDFs opened from a disabled site are excluded here by initiator; a PDF
+// with no initiator (typed URL, bookmark) is checked in handlePdfNavigation.
+const INTERCEPT_RULE_ID = 1;
 
-// Safety net for the 'restoring' and 'bypass' phases in case the navigation
-// we are waiting for never reports back.
-const JOB_SETTLE_TIMEOUT_MS = 15000;
-
-// If the tab already has a job, record this PDF navigation as part of it (so
-// that landing on it again while restoring is recognised) and return true.
-function isTabBusy(tabId, url) {
-  const job = tabJobs.get(tabId);
-  if (!job) return false;
-  job.pdfUrls.add(url);
-  return true;
-}
-
-// Must be called synchronously in the listener, after isTabBusy() and before
-// any await, so that the first interceptor to see a navigation owns it.
-function claimTab(tabId, url) {
-  tabJobs.set(tabId, { phase: 'opening', pdfUrls: new Set([url]), timer: null });
-}
-
-function releaseTab(tabId) {
-  const job = tabJobs.get(tabId);
-  if (!job) return;
-  clearTimeout(job.timer);
-  tabJobs.delete(tabId);
-}
-
-function setPhase(tabId, phase) {
-  const job = tabJobs.get(tabId);
-  if (!job) return;
-  job.phase = phase;
-  clearTimeout(job.timer);
-  job.timer = setTimeout(() => releaseTab(tabId), JOB_SETTLE_TIMEOUT_MS);
-}
-
-// Park the tab, open the PDF in Reamlet, then put the tab back:
-//   success → return to the page the PDF was opened from, or close the tab
-//             if it was opened just for the PDF
-//   failure → navigate to the original URL so the browser handles it
-async function handleInterceptedTab(tabId, url, background) {
-  // May fail if the tab has already been closed — the job is then released
-  // by onRemoved and the result below is discarded.
-  await chrome.tabs.update(tabId, { url: 'about:blank' }).catch(() => {});
-
-  const ok = await downloadViaChrome(url, background);
-  if (!tabJobs.has(tabId)) return;
-
-  if (ok) {
-    setPhase(tabId, 'restoring');
-    stepBack(tabId);
-  } else {
-    setPhase(tabId, 'bypass');
-    chrome.tabs.update(tabId, { url }).catch(() => releaseTab(tabId));
+async function syncInterceptRule() {
+  const addRules = [];
+  if (startupComplete && interceptEnabled) {
+    const condition = {
+      resourceTypes: ['main_frame'],
+      responseHeaders: [{ header: 'content-type', values: ['application/pdf*'] }],
+    };
+    if (disabledDomains.size > 0) condition.excludedInitiatorDomains = [...disabledDomains];
+    addRules.push({
+      id: INTERCEPT_RULE_ID,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        responseHeaders: [{ header: 'content-disposition', operation: 'set', value: 'attachment' }],
+      },
+      condition,
+    });
+  }
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [INTERCEPT_RULE_ID], addRules });
+    console.log('[Reamlet] Interception rule', addRules.length ? 'active' : 'removed');
+  } catch (err) {
+    console.error('[Reamlet] Failed to update interception rule:', err.message);
   }
 }
 
-// Go back one history entry. The onCommitted listener below calls this again
-// if we land on the PDF itself or on the about:blank placeholder. When there
-// is no entry to go back to, the tab was opened just for the PDF — close it.
-function stepBack(tabId) {
-  chrome.tabs.goBack(tabId).catch(() => {
-    releaseTab(tabId);
-    chrome.tabs.remove(tabId).catch(() => {});
-  });
-}
-
-chrome.webNavigation.onCommitted.addListener((details) => {
-  if (details.frameId !== 0) return;
-  const job = tabJobs.get(details.tabId);
-  if (!job) return;
-
-  if (job.phase === 'restoring') {
-    if (details.url === 'about:blank' || job.pdfUrls.has(details.url)) {
-      console.log('[Reamlet] Restoring tab', details.tabId, '— landed on', details.url, ', going back again');
-      stepBack(details.tabId);
-    } else {
-      releaseTab(details.tabId);
-    }
-  } else if (job.phase === 'bypass' && details.url !== 'about:blank') {
-    releaseTab(details.tabId);
-  }
-});
-
-// A bypass navigation that never commits (e.g. the server sends the PDF as an
-// attachment, which becomes a download) ends here instead.
-chrome.webNavigation.onErrorOccurred.addListener((details) => {
-  if (details.frameId !== 0) return;
-  if (tabJobs.get(details.tabId)?.phase === 'bypass' && details.url !== 'about:blank') {
-    releaseTab(details.tabId);
-  }
-});
-
-chrome.tabs.onRemoved.addListener((tabId) => releaseTab(tabId));
-
-// ── PDF interception: content-type ────────────────────────────
+// ── PDF navigations ───────────────────────────────────────────
+//
+// onHeadersReceived fires a few ms before the download the rule creates, and
+// is the only event that knows which tab the navigation belonged to. Record
+// it so onCreated can tell a converted navigation from an ordinary download,
+// and knows where to open the PDF if Reamlet can't.
+const pdfNavigations = new Map(); // response URL → { url, initiator, tab }
+const NAVIGATION_TTL_MS = 10000;
 
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
-    if (!startupComplete) { console.log('[Reamlet] onHeadersReceived: startup not complete, skipping', details.url); return; }
-    if (!interceptEnabled) return;
-    if (details.type !== 'main_frame' || details.tabId < 0) return;
-
+    if (details.tabId < 0) return;
     const contentType = (details.responseHeaders ?? []).find(
       (h) => h.name.toLowerCase() === 'content-type'
     )?.value ?? '';
+    if (!contentType.toLowerCase().includes('application/pdf')) return;
 
-    console.log('[Reamlet] onHeadersReceived:', details.url, '| content-type:', contentType);
-
-    if (!contentType.includes('application/pdf')) return;
-
-    const url = details.url;
-    if (isTabBusy(details.tabId, url)) { console.log('[Reamlet] onHeadersReceived: tab already being handled, skipping', url); return; }
-    if (isDomainDisabled(url, details.initiator)) { console.log('[Reamlet] onHeadersReceived: domain disabled, skipping', url); return; }
-    claimTab(details.tabId, url);
-
-    console.log('[Reamlet] Intercepted PDF via content-type:', url);
-
-    chrome.tabs.get(details.tabId)
-      .then((tab) => !tab.active, () => false)
-      .then((background) => handleInterceptedTab(details.tabId, url, background));
+    console.log('[Reamlet] PDF navigation:', details.url, '| tab:', details.tabId, '| initiator:', details.initiator);
+    const nav = {
+      url: details.url,
+      initiator: details.initiator ?? null,
+      // Read now: a tab opened just for the PDF is closed once it becomes a download.
+      tab: chrome.tabs.get(details.tabId).catch(() => null),
+    };
+    pdfNavigations.set(nav.url, nav);
+    setTimeout(() => {
+      if (pdfNavigations.get(nav.url) === nav) pdfNavigations.delete(nav.url);
+    }, NAVIGATION_TTL_MS);
   },
-  { urls: ['<all_urls>'] },
+  { urls: ['<all_urls>'], types: ['main_frame'] },
   ['responseHeaders']
 );
 
-// ── PDF interception: URL pattern ─────────────────────────────
+// For .pdf links, start fetching as soon as the navigation begins instead of
+// waiting for the browser's own response, so opening in Reamlet is no slower
+// than before. Used by handlePdfNavigation if the navigation does become a
+// PDF download; otherwise it simply expires.
+const prefetches = new Map(); // URL → { response, credentials }
+const PREFETCH_TTL_MS = 30000;
 
 chrome.webNavigation.onBeforeNavigate.addListener(
   async (details) => {
-    if (!startupComplete) { console.log('[Reamlet] onBeforeNavigate: startup not complete, skipping', details.url); return; }
-    if (!interceptEnabled) return;
-    if (details.frameId !== 0) { console.log('[Reamlet] onBeforeNavigate: sub-frame (id=' + details.frameId + '), skipping', details.url); return; }
-
-    const url = details.url;
-    if (isTabBusy(details.tabId, url)) { console.log('[Reamlet] onBeforeNavigate: tab already being handled, skipping', url); return; }
-    // Claim before awaiting anything, so onHeadersReceived for this same
-    // navigation sees the tab as taken. Released again if the domain is disabled.
-    claimTab(details.tabId, url);
-
-    console.log('[Reamlet] onBeforeNavigate: PDF URL matched, frameId=0, tabId=' + details.tabId, url);
-
-    const tab = await chrome.tabs.get(details.tabId).catch(() => null);
+    if (!startupComplete || !interceptEnabled || details.frameId !== 0) return;
+    const url = stripHash(details.url);
+    if (prefetches.has(url) || bypassUrls.has(url)) return;
 
     // For new tabs (url is empty), the opener tab is the browsing context.
     // For same-tab navigations, use this tab's last committed URL from session storage.
+    const tab = await chrome.tabs.get(details.tabId).catch(() => null);
     const contextTabId = (tab?.url === '' && tab?.openerTabId != null)
       ? tab.openerTabId
       : details.tabId;
-    const contextUrl = await getTabContextUrl(contextTabId);
-    if (isDomainDisabled(url, contextUrl)) {
-      console.log('[Reamlet] onBeforeNavigate: domain disabled, skipping', url);
-      releaseTab(details.tabId);
-      return;
-    }
+    if (isDomainDisabled(url, await getTabContextUrl(contextTabId))) return;
 
-    console.log('[Reamlet] Intercepted PDF via URL pattern:', url);
-
-    const background = tab ? !tab.active : false;
-    await handleInterceptedTab(details.tabId, url, background);
+    const credentials = authPdfsEnabled ? 'include' : 'omit';
+    const controller = new AbortController();
+    const response = fetch(url, { credentials, signal: controller.signal });
+    response.catch(() => {}); // handled by whoever takes the prefetch
+    const entry = { response, credentials };
+    prefetches.set(url, entry);
+    console.log('[Reamlet] Prefetching', url);
+    setTimeout(() => {
+      if (prefetches.get(url) !== entry) return; // taken, or replaced
+      prefetches.delete(url);
+      controller.abort();
+    }, PREFETCH_TTL_MS);
   },
   { url: [{ urlMatches: '\\.pdf(\\?[^#]*)?(?:#.*)?$' }] }
 );
 
+// Whether the interception rule applied to a navigation, i.e. its initiator
+// is not excluded. Mirrors excludedInitiatorDomains, which also covers
+// subdomains of each listed domain.
+function ruleApplied(nav) {
+  const host = nav.initiator ? getHostname(nav.initiator) : null;
+  return !host || ![...disabledDomains].some((d) => host === d || host.endsWith('.' + d));
+}
+
+function takePrefetch(url) {
+  const entry = prefetches.get(url) ?? null;
+  prefetches.delete(url);
+  return entry;
+}
+
+function stripHash(url) {
+  const i = url.indexOf('#');
+  return i === -1 ? url : url.slice(0, i);
+}
+
+// Open a PDF whose navigation the rule turned into a (now cancelled) download.
+// requestUrl is the URL the navigation started with; nav.url is where it
+// ended up after any redirects.
+async function handlePdfNavigation(nav, requestUrl) {
+  const tab = await nav.tab;
+  if (!nav.initiator && isDomainDisabled(nav.url)) {
+    console.log('[Reamlet] Domain disabled, opening in browser:', nav.url);
+    openInBrowser(nav.url, tab);
+    return;
+  }
+
+  const background = tab ? !tab.active : false;
+  const prefetch = takePrefetch(requestUrl);
+  const ok = await downloadViaChrome(prefetch ? requestUrl : nav.url, background, prefetch);
+  if (!ok) openInBrowser(nav.url, tab);
+}
+
+// ── Opening in the browser instead ────────────────────────────
+//
+// When Reamlet can't take a PDF (or shouldn't: disabled site, sign-in PDFs
+// turned off), navigate the tab it came from to the PDF — or a new tab in its
+// place if Chrome closed a tab opened just for the PDF — with a per-tab rule
+// that exempts that navigation from the interception rule.
+const BYPASS_RULE_ID_BASE = 1000;
+const BYPASS_TIMEOUT_MS = 15000;
+let nextBypassRuleId = BYPASS_RULE_ID_BASE;
+const bypassTabs = new Map(); // tabId → { ruleId, timer }
+
+// URLs being opened in the browser. If one still ends up as a download (the
+// server itself sends it as an attachment), that download is left alone.
+const bypassUrls = new Set();
+
+async function openInBrowser(url, tab) {
+  console.log('[Reamlet] Opening in browser:', url);
+  bypassUrls.add(url);
+  setTimeout(() => bypassUrls.delete(url), BYPASS_TIMEOUT_MS);
+
+  let tabId = tab ? (await chrome.tabs.get(tab.id).catch(() => null))?.id : undefined;
+  if (tabId === undefined) {
+    const props = { url: 'about:blank', active: tab?.active ?? true };
+    const created = await chrome.tabs.create({ ...props, windowId: tab?.windowId, index: tab?.index })
+      .catch(() => chrome.tabs.create(props))
+      .catch(() => null);
+    if (!created) return;
+    tabId = created.id;
+  }
+
+  await addBypassRule(tabId);
+  chrome.tabs.update(tabId, { url }).catch(() => removeBypassRule(tabId));
+}
+
+async function addBypassRule(tabId) {
+  removeBypassRule(tabId);
+  const ruleId = nextBypassRuleId++;
+  const timer = setTimeout(() => removeBypassRule(tabId), BYPASS_TIMEOUT_MS);
+  bypassTabs.set(tabId, { ruleId, timer });
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [ruleId],
+    addRules: [{
+      id: ruleId,
+      priority: 2,
+      action: { type: 'allow' },
+      condition: { tabIds: [tabId], resourceTypes: ['main_frame'] },
+    }],
+  }).catch((err) => console.error('[Reamlet] Failed to add bypass rule:', err.message));
+}
+
+function removeBypassRule(tabId) {
+  const bypass = bypassTabs.get(tabId);
+  if (!bypass) return;
+  clearTimeout(bypass.timer);
+  bypassTabs.delete(tabId);
+  chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [bypass.ruleId] }).catch(() => {});
+}
+
+// Bypass rules left behind by a previous instance of this service worker.
+async function removeStaleBypassRules() {
+  try {
+    const rules = await chrome.declarativeNetRequest.getSessionRules();
+    const stale = rules.filter((r) => r.id >= BYPASS_RULE_ID_BASE).map((r) => r.id);
+    if (stale.length) await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: stale });
+  } catch (err) {
+    console.error('[Reamlet] Failed to remove stale bypass rules:', err.message);
+  }
+}
+
+// The bypass lasts for one navigation: it ends when that navigation commits,
+// or fails without committing (e.g. it became a download).
+chrome.webNavigation.onCommitted.addListener((details) => {
+  if (details.frameId === 0 && details.url !== 'about:blank') removeBypassRule(details.tabId);
+});
+chrome.webNavigation.onErrorOccurred.addListener((details) => {
+  if (details.frameId === 0 && details.url !== 'about:blank') removeBypassRule(details.tabId);
+});
+chrome.tabs.onRemoved.addListener((tabId) => removeBypassRule(tabId));
+
 // ── PDF interception: downloads ───────────────────────────────
 
 chrome.downloads.onCreated.addListener(async (item) => {
-  if (!startupComplete) { console.log('[Reamlet] onCreated: startup not complete, skipping', item.url); return; }
   if (reamletDownloadUrls.has(item.url)) { console.log('[Reamlet] onCreated: own download, skipping', item.url); return; }
+  if (bypassUrls.has(item.finalUrl) || bypassUrls.has(item.url)) { console.log('[Reamlet] onCreated: being opened in browser, skipping', item.url); return; }
+  if (!startupComplete) { console.log('[Reamlet] onCreated: startup not complete, skipping', item.url); return; }
   if (!interceptEnabled) return;
+
+  // A PDF navigation turned into a download by the interception rule.
+  const nav = pdfNavigations.get(item.finalUrl) ?? pdfNavigations.get(item.url);
+  if (nav && ruleApplied(nav)) {
+    pdfNavigations.delete(nav.url);
+    console.log('[Reamlet] Intercepted PDF navigation:', item.url);
+    // Cancel straight away, before Chrome gets as far as a Save As prompt, and
+    // drop it from the download list; the PDF is fetched separately.
+    chrome.downloads.cancel(item.id)
+      .then(() => chrome.downloads.erase({ id: item.id }))
+      .catch(() => {});
+    await handlePdfNavigation(nav, stripHash(item.url));
+    return;
+  }
+
+  // Any other download.
   console.log('[Reamlet] onCreated:', item.url, '| mime:', item.mime, '| filename:', item.filename);
   if (!isPdfDownload(item)) { console.log('[Reamlet] onCreated: not a PDF, skipping'); return; }
   if (isDomainDisabled(item.url, item.referrer)) { console.log('[Reamlet] onCreated: domain disabled, skipping'); return; }

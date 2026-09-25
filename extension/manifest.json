@@ -3,7 +3,9 @@
   "name": "Reamlet",
   "version": "1.0.0",
   "description": "Intercepts PDF navigations and downloads and opens them in Reamlet.",
+  "minimum_chrome_version": "128",
   "permissions": [
+    "declarativeNetRequestWithHostAccess",
     "webRequest",
     "downloads",
     "nativeMessaging",
