@@ -4,6 +4,7 @@
 'use strict';
 
 const globalToggle = document.getElementById('globalToggle');
+const authToggle   = document.getElementById('authToggle');
 const domainSection = document.getElementById('domainSection');
 const domainLabel   = document.getElementById('domainLabel');
 const domainToggle  = document.getElementById('domainToggle');
@@ -11,6 +12,7 @@ const status        = document.getElementById('status');
 
 let currentHostname = null;
 let globalEnabled   = true;
+let authPdfsEnabled = true;
 let disabledDomains = [];
 
 // Get the active tab's hostname
@@ -22,8 +24,9 @@ chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
     }
   } catch { /* ignore */ }
 
-  chrome.storage.local.get(['interceptEnabled', 'disabledDomains'], (result) => {
+  chrome.storage.local.get(['interceptEnabled', 'disabledDomains', 'authPdfsEnabled'], (result) => {
     globalEnabled   = result.interceptEnabled !== false;
+    authPdfsEnabled = result.authPdfsEnabled !== false;
     disabledDomains = result.disabledDomains ?? [];
     render();
   });
@@ -32,6 +35,12 @@ chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
 globalToggle.addEventListener('change', () => {
   globalEnabled = globalToggle.checked;
   chrome.storage.local.set({ interceptEnabled: globalEnabled });
+  render();
+});
+
+authToggle.addEventListener('change', () => {
+  authPdfsEnabled = authToggle.checked;
+  chrome.storage.local.set({ authPdfsEnabled });
   render();
 });
 
@@ -50,6 +59,8 @@ domainToggle.addEventListener('change', () => {
 
 function render() {
   globalToggle.checked = globalEnabled;
+  authToggle.checked   = authPdfsEnabled;
+  authToggle.disabled  = !globalEnabled;
 
   if (currentHostname) {
     domainSection.style.display = '';
@@ -63,6 +74,8 @@ function render() {
     status.textContent = 'Interception paused — PDFs open normally.';
   } else if (currentHostname && disabledDomains.includes(currentHostname)) {
     status.textContent = 'PDFs on ' + currentHostname + ' open normally.';
+  } else if (!authPdfsEnabled) {
+    status.textContent = 'PDFs will open in Reamlet, except ones behind sign-in.';
   } else {
     status.textContent = 'PDFs will open in Reamlet.';
   }
