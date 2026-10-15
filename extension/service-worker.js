@@ -637,7 +637,29 @@ chrome.tabs.onRemoved.addListener((tabId) => removeBypassRule(tabId));
 
 // ── PDF interception: downloads ───────────────────────────────
 
+// Chrome also fires downloads.onCreated for every download in its saved history
+// when the profile loads, which can be well after onStartup (slow disk,
+// antivirus, a large history) and so after startupComplete. Those items are
+// complete or interrupted and began long ago; a download the user has just
+// started is in progress and began moments ago. The window is generous because
+// the event can sit queued while the service worker starts.
+const NEW_DOWNLOAD_MAX_AGE_MS = 30000;
+const NEW_DOWNLOAD_CLOCK_SKEW_MS = 30000;
+
+// Why a download is not a newly started one, or null if it is.
+function staleDownloadReason(item) {
+  if (item.state !== 'in_progress') return 'state is ' + item.state;
+  const startedAt = Date.parse(item.startTime);
+  if (Number.isNaN(startedAt)) return 'no valid start time (' + item.startTime + ')';
+  const ageMs = Date.now() - startedAt;
+  if (ageMs > NEW_DOWNLOAD_MAX_AGE_MS) return 'started ' + Math.round(ageMs / 1000) + ' s ago';
+  if (ageMs < -NEW_DOWNLOAD_CLOCK_SKEW_MS) return 'start time is ' + Math.round(-ageMs / 1000) + ' s in the future';
+  return null;
+}
+
 chrome.downloads.onCreated.addListener(async (item) => {
+  const stale = staleDownloadReason(item);
+  if (stale) { console.log('[Reamlet] onCreated: not a new download (' + stale + '), skipping', item.url); return; }
   if (reamletDownloadUrls.has(item.url)) { console.log('[Reamlet] onCreated: own download, skipping', item.url); return; }
   if (bypassUrls.has(item.finalUrl) || bypassUrls.has(item.url)) { console.log('[Reamlet] onCreated: being opened in browser, skipping', item.url); return; }
   if (!startupComplete) { console.log('[Reamlet] onCreated: startup not complete, skipping', item.url); return; }
