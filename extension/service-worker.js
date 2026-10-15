@@ -165,6 +165,35 @@ function isPdfDownload(item) {
   return isPdfUrl(item.url);
 }
 
+// The name to save a PDF under: the server's Content-Disposition filename
+// (filename* first, then filename), else the last segment of the URL. Made
+// safe as a Windows filename and always ending in .pdf.
+function pdfFileName(contentDisposition, url) {
+  const cd = contentDisposition ?? '';
+  let name = '';
+  const encoded = /filename\*\s*=\s*[\w-]+'[^']*'([^;]+)/i.exec(cd);
+  if (encoded) {
+    try { name = decodeURIComponent(encoded[1].trim()); } catch { /* malformed */ }
+  }
+  if (!name) {
+    const plain = /filename\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;]+))/i.exec(cd);
+    if (plain) name = (plain[1]?.replace(/\\(.)/g, '$1') ?? plain[2]).trim();
+  }
+  if (!name) {
+    let segment = '';
+    try { segment = new URL(url).pathname.split('/').pop(); } catch { /* ignore */ }
+    try { name = decodeURIComponent(segment); } catch { name = segment; }
+  }
+  name = name.split(/[\\/]/).pop()
+    .replace(/[<>:"|?*\x00-\x1f]/g, '_')
+    .replace(/[. ]+$/, '')
+    .trim();
+  if (/^(con|prn|aux|nul|com\d|lpt\d)(\.|$)/i.test(name)) name = '_' + name;
+  if (!name.toLowerCase().endsWith('.pdf')) name = (name || 'download') + '.pdf';
+  if (name.length > 200) name = name.slice(0, 196) + '.pdf';
+  return name;
+}
+
 // Send a message to the native host and return a Promise that resolves with
 // the response, or rejects on any native messaging error.
 function sendToNativeHost(msg) {
@@ -209,7 +238,8 @@ const FETCH_MAX_BYTES = 750 * 1024;
 // pending: a fetch() of this URL already in flight, used instead of
 // starting a new one.
 //
-// Resolves to one of:
+// Resolves to { status, filename }. filename is the PDF's own name (see
+// pdfFileName), or null if no response was received. status is one of:
 //   'opened'      — sent to Reamlet
 //   'unavailable' — the URL did not return a PDF with these credentials
 //                   (e.g. 401/403 or a redirect to a sign-in page)
@@ -222,45 +252,46 @@ async function fetchIntoReamlet(url, background, credentials, pending = null) {
     res = await (pending ?? fetch(url, { credentials }));
   } catch (err) {
     console.error('[Reamlet] fetch() error:', err.message);
-    return 'unavailable';
+    return { status: 'unavailable', filename: null };
   }
+  const filename = pdfFileName(res.headers.get('content-disposition'), res.url || url);
   if (!res.ok) {
     console.error('[Reamlet] fetch() returned status:', res.status);
-    return 'unavailable';
+    return { status: 'unavailable', filename };
   }
   const contentType = res.headers.get('content-type') ?? '';
   if (!contentType.includes('application/pdf')) {
     console.error('[Reamlet] fetch() got unexpected content-type:', contentType);
-    return 'unavailable';
+    return { status: 'unavailable', filename };
   }
   const declaredLength = Number(res.headers.get('content-length'));
   if (declaredLength > FETCH_MAX_BYTES) {
     console.warn('[Reamlet] PDF too large for fetch path:', declaredLength, 'bytes');
     res.body?.cancel().catch(() => {});
-    return 'too-large';
+    return { status: 'too-large', filename };
   }
 
   try {
     const buf = await res.arrayBuffer();
     if (buf.byteLength > FETCH_MAX_BYTES) {
       console.warn('[Reamlet] PDF too large for fetch path:', buf.byteLength, 'bytes');
-      return 'too-large';
+      return { status: 'too-large', filename };
     }
     // Encode to base64 without spread (avoids stack overflow on large arrays)
     const bytes = new Uint8Array(buf);
     let binary = '';
     for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
     const base64 = btoa(binary);
-    console.log('[Reamlet] fetch() got', buf.byteLength, 'bytes — sending to native host');
-    const response = await sendToNativeHost({ bytes: base64, background });
+    console.log('[Reamlet] fetch() got', buf.byteLength, 'bytes (' + filename + ') — sending to native host');
+    const response = await sendToNativeHost({ bytes: base64, filename, background });
     if (!response?.ok) {
       console.error('[Reamlet] Host returned error for bytes message:', response?.error);
-      return 'host-error';
+      return { status: 'host-error', filename };
     }
-    return 'opened';
+    return { status: 'opened', filename };
   } catch (err) {
     console.error('[Reamlet] fetch() path error:', err.message);
-    return 'host-error';
+    return { status: 'host-error', filename };
   }
 }
 
@@ -292,7 +323,7 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
 // browser rather than downloaded with that session.
 async function downloadViaChrome(url, background = false, prefetch = null) {
   const credentials = prefetch?.credentials ?? (authPdfsEnabled ? 'include' : 'omit');
-  const result = await fetchIntoReamlet(url, background, credentials, prefetch?.response);
+  const { status: result, filename: serverName } = await fetchIntoReamlet(url, background, credentials, prefetch?.response);
   if (result === 'opened') return true;
   if (result === 'unavailable' && !authPdfsEnabled) {
     console.log('[Reamlet] PDF needs sign-in and those are disabled — leaving it to the browser:', url);
@@ -305,14 +336,7 @@ async function downloadViaChrome(url, background = false, prefetch = null) {
   return new Promise((resolve) => {
     reamletDownloadUrls.add(url);
 
-    let filename;
-    try {
-      const base = new URL(url).pathname.split('/').pop() || 'download';
-      const name = base.toLowerCase().endsWith('.pdf') ? base : `${base}.pdf`;
-      filename = `${STAGING_FOLDER}/${name}`;
-    } catch {
-      filename = `${STAGING_FOLDER}/download.pdf`;
-    }
+    const filename = `${STAGING_FOLDER}/${serverName ?? pdfFileName(null, url)}`;
     reamletDownloadFilenames.set(url, filename);
 
     console.log('[Reamlet] downloadViaChrome starting — filename:', filename);
@@ -366,7 +390,7 @@ async function downloadViaChrome(url, background = false, prefetch = null) {
             console.error('[Reamlet] Download', downloadId, 'interrupted — error:', reason);
             if (reason === 'SERVER_BAD_CONTENT') {
               console.log('[Reamlet] SERVER_BAD_CONTENT likely caused by Content-Disposition: inline — trying fetch fallback');
-              resolve(fetchIntoReamlet(url, background, credentials).then((r) => r === 'opened'));
+              resolve(fetchIntoReamlet(url, background, credentials).then((r) => r.status === 'opened'));
             } else {
               resolve(false);
             }
